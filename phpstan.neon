@@ -1,0 +1,5 @@
+includes:
+  - phpstan.neon.dist
+parameters:
+  editorUrlTitle: 'file://%%file%%:%%line%%'
+  editorUrl: 'file://%%file%%:%%line%%'
