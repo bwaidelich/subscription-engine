@@ -1,0 +1,51 @@
+{
+    "name": "wwwision/subscription-engine",
+    "description": "Subscription engine for event-sourced systems",
+    "type": "package",
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "Bastian Waidelich",
+            "email": "b.waidelich@wwwision.de"
+        }
+    ],
+    "funding": [
+        {
+            "type": "github",
+            "url": "https://github.com/sponsors/bwaidelich"
+        },
+        {
+            "type": "paypal",
+            "url": "https://www.paypal.me/bwaidelich"
+        }
+    ],
+    "require": {
+        "php": ">=8.3",
+        "psr/log": "^1 || ^2 || ^3"
+    },
+    "require-dev": {
+        "roave/security-advisories": "dev-latest",
+        "phpstan/phpstan": "^2",
+        "squizlabs/php_codesniffer": "^4.0.x-dev",
+        "phpunit/phpunit": "^11"
+    },
+    "autoload": {
+        "psr-4": {
+            "Wwwision\\SubscriptionEngine\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Wwwision\\SubscriptionEngine\\Tests\\": "tests/"
+        }
+    },
+    "scripts": {
+        "test:phpstan": "phpstan",
+        "test:cs": "phpcs --colors src",
+        "test:cs:fix": "phpcbf --colors src",
+        "test": [
+            "@test:phpstan",
+            "@test:cs"
+        ]
+    }
+}
