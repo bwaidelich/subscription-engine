@@ -20,4 +20,9 @@ final readonly class Result
     {
         return new self($errors);
     }
+
+    public function successful(): bool
+    {
+        return $this->errors === null;
+    }
 }

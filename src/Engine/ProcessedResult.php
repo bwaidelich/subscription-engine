@@ -22,9 +22,9 @@ final readonly class ProcessedResult
         return new self($numberOfProcessedEvents, $errors);
     }
 
-    /** @phpstan-assert-if-true !null $this->errors */
-    public function hadErrors(): bool
+    /** @phpstan-assert-if-true null $this->errors */
+    public function successful(): bool
     {
-        return $this->errors !== null;
+        return $this->errors === null;
     }
 }

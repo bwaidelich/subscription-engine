@@ -12,4 +12,6 @@ interface EventStore
      * @return iterable<Event>
      */
     public function read(Position $startPosition): iterable;
+
+    public function lastPosition(): Position;
 }

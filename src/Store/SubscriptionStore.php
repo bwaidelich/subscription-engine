@@ -4,12 +4,8 @@ declare(strict_types=1);
 
 namespace Wwwision\SubscriptionEngine\Store;
 
-use Wwwision\SubscriptionEngine\Subscription\Position;
 use Wwwision\SubscriptionEngine\Subscription\Subscription;
-use Wwwision\SubscriptionEngine\Subscription\SubscriptionError;
-use Wwwision\SubscriptionEngine\Subscription\SubscriptionId;
 use Wwwision\SubscriptionEngine\Subscription\Subscriptions;
-use Wwwision\SubscriptionEngine\Subscription\SubscriptionStatus;
 
 interface SubscriptionStore
 {
