@@ -10,17 +10,17 @@ namespace Wwwision\SubscriptionEngine\Subscription;
 enum RunMode : string
 {
     /**
-     * Handle all events
+     * Handle all events (default for projections)
      */
     case FROM_BEGINNING = 'FROM_BEGINNING';
 
     /**
-     * Handle all events
+     * Handle all events (default for event handlers that must not be triggered for events from the past)
      */
     case FROM_NOW = 'FROM_NOW';
 
     /**
-     * Handle all events only once
+     * Handle all events only once (rarely useful for one-time processes, like migrations)
      */
     case ONCE = 'ONCE';
 }

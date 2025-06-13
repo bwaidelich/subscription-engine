@@ -4,15 +4,17 @@ declare(strict_types=1);
 
 namespace Wwwision\SubscriptionEngine\Tests\Mocks;
 
-use Wwwision\SubscriptionEngine\EventStore\Event;
-use Wwwision\SubscriptionEngine\EventStore\EventStore;
+use Wwwision\SubscriptionEngine\EventStore\EventStoreAdapter;
 use Wwwision\SubscriptionEngine\Subscription\Position;
 
-final class InMemoryEventStore implements EventStore
+/**
+ * @implements EventStoreAdapter<MockEvent>
+ */
+final class InMemoryEventStoreAdapter implements EventStoreAdapter
 {
 
     /**
-     * @var array<Event>
+     * @var array<MockEvent>
      */
     private array $events = [];
 
@@ -26,21 +28,14 @@ final class InMemoryEventStore implements EventStore
         return Position::fromInteger(count($this->events));
     }
 
+    public function eventPosition(object $event): Position
+    {
+        return $event->position;
+    }
+
     public function append(mixed $data): void
     {
         $position = Position::fromInteger(count($this->events) + 1);
-        $this->events[] = new class ($position, $data) implements Event {
-
-            public function __construct(
-                private Position $position,
-                public mixed $data,
-            ) {
-            }
-
-            public function position(): Position
-            {
-                return $this->position;
-            }
-        };
+        $this->events[] = new MockEvent($position, $data);
     }
 }

@@ -2,31 +2,33 @@
 
 declare(strict_types=1);
 
-namespace Wwwision\SubscriptionEngine\Engine;
+namespace Wwwision\SubscriptionEngine;
 
-use Closure;
 use Psr\Log\LoggerInterface;
 use RuntimeException;
 use Throwable;
-use Wwwision\SubscriptionEngine\Engine\Event\ActiveSubscriptionSetup;
-use Wwwision\SubscriptionEngine\Engine\Event\CatchUpFinished;
-use Wwwision\SubscriptionEngine\Engine\Event\CatchUpInitiated;
-use Wwwision\SubscriptionEngine\Engine\Event\CatchUpStarted;
-use Wwwision\SubscriptionEngine\Engine\Event\EngineEvent;
-use Wwwision\SubscriptionEngine\Engine\Event\FailedToSetupSubscriber;
-use Wwwision\SubscriptionEngine\Engine\Event\NoSubscriptionsFound;
-use Wwwision\SubscriptionEngine\Engine\Event\SetupStarted;
-use Wwwision\SubscriptionEngine\Engine\Event\SubscriberFailedToHandleEvent;
-use Wwwision\SubscriptionEngine\Engine\Event\SubscriberHandledEvent;
-use Wwwision\SubscriptionEngine\Engine\Event\SubscriberNotFound;
-use Wwwision\SubscriptionEngine\Engine\Event\SubscriberSkippedEvent;
-use Wwwision\SubscriptionEngine\Engine\Event\SubscriptionDetached;
-use Wwwision\SubscriptionEngine\Engine\Event\SubscriptionDiscovered;
-use Wwwision\SubscriptionEngine\EventStore\EventStore;
+use Wwwision\SubscriptionEngine\Engine\EngineEvent\ActiveSubscriptionSetup;
+use Wwwision\SubscriptionEngine\Engine\EngineEvent\CatchUpFinished;
+use Wwwision\SubscriptionEngine\Engine\EngineEvent\CatchUpInitiated;
+use Wwwision\SubscriptionEngine\Engine\EngineEvent\CatchUpStarted;
+use Wwwision\SubscriptionEngine\Engine\EngineEvent\EngineEvent;
+use Wwwision\SubscriptionEngine\Engine\EngineEvent\FailedToSetupSubscriber;
+use Wwwision\SubscriptionEngine\Engine\EngineEvent\NoSubscriptionsFound;
+use Wwwision\SubscriptionEngine\Engine\EngineEvent\SetupStarted;
+use Wwwision\SubscriptionEngine\Engine\EngineEvent\SubscriberFailedToHandleEvent;
+use Wwwision\SubscriptionEngine\Engine\EngineEvent\SubscriberHandledEvent;
+use Wwwision\SubscriptionEngine\Engine\EngineEvent\SubscriberNotFound;
+use Wwwision\SubscriptionEngine\Engine\EngineEvent\SubscriberSkippedEvent;
+use Wwwision\SubscriptionEngine\Engine\EngineEvent\SubscriptionDetached;
+use Wwwision\SubscriptionEngine\Engine\EngineEvent\SubscriptionDiscovered;
+use Wwwision\SubscriptionEngine\Engine\Error;
+use Wwwision\SubscriptionEngine\Engine\Errors;
+use Wwwision\SubscriptionEngine\Engine\ProcessedResult;
+use Wwwision\SubscriptionEngine\Engine\Result;
+use Wwwision\SubscriptionEngine\Engine\SubscriptionEngineCriteria;
+use Wwwision\SubscriptionEngine\EventStore\EventStoreAdapter;
 use Wwwision\SubscriptionEngine\Store\SubscriptionCriteria;
 use Wwwision\SubscriptionEngine\Store\SubscriptionStore;
-use Wwwision\SubscriptionEngine\Subscriber\ProvidesReset;
-use Wwwision\SubscriptionEngine\Subscriber\ProvidesSetup;
 use Wwwision\SubscriptionEngine\Subscriber\Subscribers;
 use Wwwision\SubscriptionEngine\Subscription\Position;
 use Wwwision\SubscriptionEngine\Subscription\RunMode;
@@ -36,25 +38,20 @@ use Wwwision\SubscriptionEngine\Subscription\SubscriptionStatus;
 use Wwwision\SubscriptionEngine\Subscription\SubscriptionStatusFilter;
 
 /**
- * This is the internal core for the catchup
- *
- * All functionality is low level and well encapsulated and abstracted by the {@see ContentRepositoryMaintainer}
- * It presents the only API way to interact with catchup and offers more maintenance tasks.
- *
- * This implementation is heavily inspired and adjusted from the event-sourcing package of "patchlevel":
- * {@link https://github.com/patchlevel/event-sourcing/}
- *
- * @internal implementation detail of the catchup. See {@see ContentRepository::handle()} and {@see ContentRepositoryMaintainer}
+ * @template E of object
  */
 final class SubscriptionEngine
 {
     /**
-     * @var array<callable(EngineEvent): void>
+     * @var array<callable(EngineEvent<E|void>): void>
      */
-    private array $eventSubscribers = [];
+    private array $engineEventSubscribers = [];
 
+    /**
+     * @param EventStoreAdapter<E> $eventStoreAdapter
+     */
     public function __construct(
-        private readonly EventStore $eventStore,
+        private readonly EventStoreAdapter $eventStoreAdapter,
         private readonly SubscriptionStore $subscriptionStore,
         private readonly Subscribers $subscribers,
         private readonly LoggerInterface|null $logger = null,
@@ -62,18 +59,18 @@ final class SubscriptionEngine
     }
 
     /**
-     * @param callable(EngineEvent): void $callback
+     * @param callable(EngineEvent<E|void>): void $callback
      */
-    public function onEvent(callable $callback): void
+    public function onEngineEvent(callable $callback): void
     {
-        $this->eventSubscribers[] = $callback;
+        $this->engineEventSubscribers[] = $callback;
     }
 
     public function setup(SubscriptionEngineCriteria|null $criteria = null): Result
     {
         $criteria ??= SubscriptionEngineCriteria::noConstraints();
 
-        $this->dispatch(new SetupStarted());
+        $this->dispatchEngineEvent(new SetupStarted());
 
         $this->subscriptionStore->setup();
         $this->discoverNewSubscriptions();
@@ -84,7 +81,7 @@ final class SubscriptionEngine
         ]));
         $subscriptions = $this->subscriptionStore->findByCriteriaForUpdate($subscriptionCriteria);
         if ($subscriptions->isEmpty()) {
-            $this->dispatch(new NoSubscriptionsFound($subscriptionCriteria));
+            $this->dispatchEngineEvent(new NoSubscriptionsFound($subscriptionCriteria));
             return Result::success();
         }
         $errors = [];
@@ -121,9 +118,7 @@ final class SubscriptionEngine
         }
         $errors = [];
         foreach ($subscriptions as $subscription) {
-            if ($subscription->status === SubscriptionStatus::NEW
-                || !$this->subscribers->contain($subscription->id)
-            ) {
+            if ($subscription->status === SubscriptionStatus::NEW || !$this->subscribers->contain($subscription->id)) {
                 // Todo mark projections as detached like setup or catchup?
                 continue;
             }
@@ -157,7 +152,7 @@ final class SubscriptionEngine
             );
 
             $this->subscriptionStore->add($subscription);
-            $this->dispatch(new SubscriptionDiscovered($subscription));
+            $this->dispatchEngineEvent(new SubscriptionDiscovered($subscription));
         }
     }
 
@@ -169,62 +164,62 @@ final class SubscriptionEngine
     {
         if (!$this->subscribers->contain($subscription->id)) {
             // mark detached subscriptions as we cannot set up
-            $this->dispatch(new SubscriberNotFound($subscription));
+            $this->dispatchEngineEvent(new SubscriberNotFound($subscription));
             $subscription = $subscription->with(status: SubscriptionStatus::DETACHED);
             $this->subscriptionStore->update($subscription);
-            $this->dispatch(new SubscriptionDetached($subscription));
+            $this->dispatchEngineEvent(new SubscriptionDetached($subscription));
             return null;
         }
 
         $subscriber = $this->subscribers->get($subscription->id);
-        if ($subscriber->handler instanceof ProvidesSetup) {
+        if ($subscriber->setup !== null) {
             try {
-                $subscriber->handler->setup();
+                ($subscriber->setup)();
             } catch (Throwable $e) {
-                $this->dispatch(new FailedToSetupSubscriber($subscription, $subscriber, $e));
+                $this->dispatchEngineEvent(new FailedToSetupSubscriber($subscription, $e));
                 $this->subscriptionStore->update($subscription->withError(SubscriptionError::fromPreviousStatusAndException($subscription->status, $e)));
                 return Error::create($subscription->id, $e->getMessage(), $e, null);
             }
         }
 
         if ($subscription->status === SubscriptionStatus::ACTIVE) {
-            $this->dispatch(new ActiveSubscriptionSetup($subscription, $subscriber));
+            $this->dispatchEngineEvent(new ActiveSubscriptionSetup($subscription));
             return null;
         }
         if ($subscription->runMode === RunMode::FROM_NOW) {
             $this->subscriptionStore->update(
                 $subscription->with(
                     status: SubscriptionStatus::ACTIVE,
-                    position: $this->eventStore->lastPosition(),
+                    position: $this->eventStoreAdapter->lastPosition(),
                 )
             );
             return null;
         }
         $this->subscriptionStore->update($subscription->with(status: SubscriptionStatus::BOOTING));
-        $this->logger?->debug(sprintf('Subscription Engine: Subscriber "%s" for "%s" has been setup, set to %s from previous %s.', $subscriber::class, $subscription->id->value, SubscriptionStatus::BOOTING->value, $subscription->status->name));
+        $this->logger?->debug(sprintf('Subscription Engine: Subscriber for "%s" has been setup, set to %s from previous %s.', $subscription->id->value, SubscriptionStatus::BOOTING->value, $subscription->status->name));
         return null;
     }
 
     private function resetSubscription(Subscription $subscription): ?Error
     {
         $subscriber = $this->subscribers->get($subscription->id);
-        if (!$subscriber->handler instanceof ProvidesReset) {
-            throw new RuntimeException(sprintf('Subscriber "%s" for "%s" does not implement the %s interface.', $subscriber::class, $subscription->id->value, ProvidesReset::class), 1736161538);
+        if ($subscriber->reset === null) {
+            throw new RuntimeException(sprintf('No reset function provided for subscriber for "%s".', $subscription->id->value), 1736161538);
         }
         try {
-            $subscriber->handler->reset();
+            ($subscriber->reset)();
         } catch (Throwable $e) {
-            $this->logger?->error(sprintf('Subscription Engine: Subscriber "%s" for "%s" has an error in the resetState method: %s', $subscriber::class, $subscription->id->value, $e->getMessage()));
+            $this->logger?->error(sprintf('Subscription Engine: Subscriber for "%s" has an error in the resetState method: %s', $subscription->id->value, $e->getMessage()));
             return Error::create($subscription->id, $e->getMessage(), $e, null);
         }
         $this->subscriptionStore->update($subscription->with(status: SubscriptionStatus::BOOTING, position: Position::none())->withoutError());
-        $this->logger?->debug(sprintf('Subscription Engine: For Subscriber "%s" for "%s" the resetState method has been executed.', $subscriber::class, $subscription->id->value));
+        $this->logger?->debug(sprintf('Subscription Engine: For Subscriber for "%s" the resetState method has been executed.', $subscription->id->value));
         return null;
     }
 
     private function catchUpSubscriptions(SubscriptionEngineCriteria $criteria, SubscriptionStatusFilter $status): ProcessedResult
     {
-        $this->dispatch(new CatchUpInitiated($criteria, $status));
+        $this->dispatchEngineEvent(new CatchUpInitiated($criteria, $status));
 
         $subscriptionCriteria = SubscriptionCriteria::forEngineCriteriaAndStatus($criteria, $status);
 
@@ -239,38 +234,37 @@ final class SubscriptionEngine
             if (!$this->subscribers->contain($subscription->id)) {
                 // mark detached subscriptions as we cannot handle them and exclude them from catchup
                 $this->subscriptionStore->update($subscription->with(status: SubscriptionStatus::DETACHED));
-                $this->dispatch(new SubscriptionDetached($subscription));
+                $this->dispatchEngineEvent(new SubscriptionDetached($subscription));
                 $subscriptionsToCatchup = $subscriptionsToCatchup->without($subscription->id);
             }
         }
 
         if ($subscriptionsToCatchup->isEmpty()) {
-            $this->dispatch(new NoSubscriptionsFound($subscriptionCriteria));
+            $this->dispatchEngineEvent(new NoSubscriptionsFound($subscriptionCriteria));
             $this->subscriptionStore->commit();
             return ProcessedResult::success(0);
         }
 
         $startPosition = $subscriptionsToCatchup->lowestPosition()?->next() ?? Position::none();
-        $this->dispatch(new CatchUpStarted($subscriptionsToCatchup, $startPosition));
+        $this->dispatchEngineEvent(new CatchUpStarted($subscriptionsToCatchup, $startPosition));
 
         /** @var array<string,Position> $highestPositionForSubscriber */
         $highestPositionForSubscriber = [];
 
-        foreach ($this->eventStore->read($startPosition) as $event) {
-            $eventPosition = $event->position();
+        foreach ($this->eventStoreAdapter->read($startPosition) as $event) {
+            $eventPosition = $this->eventStoreAdapter->eventPosition($event);
             foreach ($subscriptionsToCatchup as $subscription) {
+                $subscriber = $this->subscribers->get($subscription->id);
                 if (!$eventPosition->isAheadOf($subscription->position)) {
-                    $this->dispatch(new SubscriberSkippedEvent($subscription, $subscriber, $event));
+                    $this->dispatchEngineEvent(new SubscriberSkippedEvent($subscription, $event, $eventPosition));
                     continue;
                 }
-                $subscriber = $this->subscribers->get($subscription->id);
-
                 try {
                     ($subscriber->handler)($event);
                 } catch (Throwable $e) {
                     // ERROR Case:
                     $errors[] = Error::create($subscription->id, $e->getMessage(), $errors === [] ? $e : null, $eventPosition);
-                    $this->dispatch(new SubscriberFailedToHandleEvent($subscription, $subscriber, $event, $e));
+                    $this->dispatchEngineEvent(new SubscriberFailedToHandleEvent($subscription, $event, $eventPosition, $e));
 
                     // for the leftover events we are not including this failed subscription for catchup
                     $subscriptionsToCatchup = $subscriptionsToCatchup->without($subscription->id);
@@ -280,7 +274,7 @@ final class SubscriptionEngine
                     continue;
                 }
                 // HAPPY Case:
-                $this->dispatch(new SubscriberHandledEvent($subscription, $subscriber, $event));
+                $this->dispatchEngineEvent(new SubscriberHandledEvent($subscription, $event, $eventPosition));
                 $highestPositionForSubscriber[$subscription->id->value] = $eventPosition;
             }
             $numberOfProcessedEvents++;
@@ -295,13 +289,16 @@ final class SubscriptionEngine
         }
         $this->subscriptionStore->commit();
         $errorsVo = $errors !== [] ? Errors::fromArray($errors) : null;
-        $this->dispatch(new CatchUpFinished($subscriptionsToCatchup, $numberOfProcessedEvents, $errorsVo));
+        $this->dispatchEngineEvent(new CatchUpFinished($subscriptionsToCatchup, $numberOfProcessedEvents, $errorsVo));
         return $errorsVo === null ? ProcessedResult::success($numberOfProcessedEvents) : ProcessedResult::failed($numberOfProcessedEvents, $errorsVo);
     }
 
-    private function dispatch(EngineEvent $event): void
+    /**
+     * @param EngineEvent<E|void> $event
+     */
+    private function dispatchEngineEvent(EngineEvent $event): void
     {
-        foreach ($this->eventSubscribers as $subscriber) {
+        foreach ($this->engineEventSubscribers as $subscriber) {
             ($subscriber)($event);
         }
     }

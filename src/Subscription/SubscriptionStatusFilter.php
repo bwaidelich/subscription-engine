@@ -38,6 +38,11 @@ final class SubscriptionStatusFilter implements JsonSerializable
         return new self($statusByValue);
     }
 
+    public static function any(): self
+    {
+        return self::fromArray(SubscriptionStatus::cases());
+    }
+
     public static function fromStatus(SubscriptionStatus $status): self
     {
         return new self([$status->value => $status]);

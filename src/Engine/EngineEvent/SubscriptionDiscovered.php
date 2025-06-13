@@ -2,13 +2,15 @@
 
 declare(strict_types=1);
 
-namespace Wwwision\SubscriptionEngine\Engine\Event;
+namespace Wwwision\SubscriptionEngine\Engine\EngineEvent;
 
 use Wwwision\SubscriptionEngine\Subscription\Subscription;
 
+/**
+ * @implements EngineEvent<void>
+ */
 final readonly class SubscriptionDiscovered implements EngineEvent
 {
-
     public function __construct(
         public Subscription $subscription,
     ) {

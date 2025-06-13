@@ -25,8 +25,7 @@ final readonly class Subscription
         SubscriptionId|string $id,
         RunMode $runMode,
         SubscriptionStatus $status,
-    ): self
-    {
+    ): self {
         if (is_string($id)) {
             $id = SubscriptionId::fromString($id);
         }

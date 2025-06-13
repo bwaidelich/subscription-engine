@@ -2,14 +2,16 @@
 
 declare(strict_types=1);
 
-namespace Wwwision\SubscriptionEngine\Engine\Event;
+namespace Wwwision\SubscriptionEngine\Engine\EngineEvent;
 
 use Wwwision\SubscriptionEngine\Engine\Errors;
 use Wwwision\SubscriptionEngine\Subscription\Subscriptions;
 
+/**
+ * @implements EngineEvent<void>
+ */
 final readonly class CatchUpFinished implements EngineEvent
 {
-
     public function __construct(
         public Subscriptions $subscriptions,
         public int $numberOfProcessedEvents,

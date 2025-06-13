@@ -6,14 +6,9 @@ namespace Wwwision\SubscriptionEngine\Tests\PHPUnit\Engine;
 
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\TestCase;
-use Wwwision\SubscriptionEngine\Engine\Event\EngineEvent;
-use Wwwision\SubscriptionEngine\Engine\Event\NoSubscriptionsFound;
-use Wwwision\SubscriptionEngine\Engine\SubscriptionEngine;
-use Wwwision\SubscriptionEngine\EventStore\Event;
-use Wwwision\SubscriptionEngine\EventStore\EventStore;
+use Wwwision\SubscriptionEngine\Engine\EngineEvent\EngineEvent;
+use Wwwision\SubscriptionEngine\Engine\EngineEvent\NoSubscriptionsFound;
 use Wwwision\SubscriptionEngine\Store\SubscriptionCriteria;
-use Wwwision\SubscriptionEngine\Subscriber\EventHandler;
-use Wwwision\SubscriptionEngine\Subscriber\ProvidesSetup;
 use Wwwision\SubscriptionEngine\Subscriber\Subscriber;
 use Wwwision\SubscriptionEngine\Subscriber\Subscribers;
 use Wwwision\SubscriptionEngine\Subscription\Position;
@@ -21,13 +16,15 @@ use Wwwision\SubscriptionEngine\Subscription\RunMode;
 use Wwwision\SubscriptionEngine\Subscription\Subscription;
 use Wwwision\SubscriptionEngine\Subscription\SubscriptionId;
 use Wwwision\SubscriptionEngine\Subscription\SubscriptionStatus;
-use Wwwision\SubscriptionEngine\Tests\Mocks\InMemoryEventStore;
+use Wwwision\SubscriptionEngine\SubscriptionEngine;
+use Wwwision\SubscriptionEngine\Tests\Mocks\InMemoryEventStoreAdapter;
 use Wwwision\SubscriptionEngine\Tests\Mocks\InMemorySubscriptionStore;
+use Wwwision\SubscriptionEngine\Tests\Mocks\MockEvent;
 
 #[CoversClass(SubscriptionEngine::class)]
 final class SubscriptionEngineTest extends TestCase
 {
-    private InMemoryEventStore $eventStore;
+    private InMemoryEventStoreAdapter $eventStore;
 
     private InMemorySubscriptionStore $subscriptionStore;
 
@@ -41,7 +38,7 @@ final class SubscriptionEngineTest extends TestCase
     protected function setUp(): void
     {
         $this->subscribers = Subscribers::none();
-        $this->eventStore = new InMemoryEventStore();
+        $this->eventStore = new InMemoryEventStoreAdapter();
         $this->subscriptionStore = new InMemorySubscriptionStore();
     }
 
@@ -77,14 +74,14 @@ final class SubscriptionEngineTest extends TestCase
     public function test_setup_reports_failed_subscriber_setups(): void
     {
         $this->subscriptionStore->add(Subscription::create(id: 's1', runMode: RunMode::FROM_BEGINNING, status: SubscriptionStatus::ACTIVE));
-        $handler = new class implements EventHandler, ProvidesSetup {
-            public function __invoke(Event $event): void { /* no-op */ }
+        $handler = new class {
+            public function __invoke(MockEvent $event): void { /* no-op */ }
 
             public function setup(): void {
                 throw new \Error('Just testing');
             }
         };
-        $this->subscribers = $this->subscribers->with(new Subscriber(SubscriptionId::fromString('s1'), RunMode::FROM_NOW, $handler));
+        $this->subscribers = $this->subscribers->with(new Subscriber(SubscriptionId::fromString('s1'), RunMode::FROM_NOW, $handler, $handler->setup(...)));
         $result = $this->subscriptionEngine()->setup();
 
         $this->assertSubscriptions(
@@ -93,7 +90,7 @@ final class SubscriptionEngineTest extends TestCase
 
         $this->assertEmittedEngineEvents(
             'SetupStarted: Start to setup',
-            'FailedToSetupSubscriber: Subscriber "' . $handler::class . '" for "s1" has an error in the setup method: Just testing'
+            'FailedToSetupSubscriber: Subscriber for "s1" has an error in the setup method: Just testing'
         );
         self::assertFalse($result->successful());
     }
@@ -102,8 +99,7 @@ final class SubscriptionEngineTest extends TestCase
     {
         $this->eventStore->append('event at #1');
         $this->eventStore->append('event at #2');
-        $handler = $this->createMock(EventHandler::class);
-        $this->subscribers = $this->subscribers->with(new Subscriber(SubscriptionId::fromString('s1'), RunMode::FROM_BEGINNING, $handler));
+        $this->subscribers = $this->subscribers->with(new Subscriber(SubscriptionId::fromString('s1'), RunMode::FROM_BEGINNING, fn () => null));
         $result = $this->subscriptionEngine()->setup();
 
         $this->assertSubscriptions(
@@ -122,8 +118,7 @@ final class SubscriptionEngineTest extends TestCase
         $this->eventStore->append('event at #1');
         $this->eventStore->append('event at #2');
         $this->eventStore->append('event at #3');
-        $handler = $this->createMock(EventHandler::class);
-        $this->subscribers = $this->subscribers->with(new Subscriber(SubscriptionId::fromString('s1'), RunMode::FROM_NOW, $handler));
+        $this->subscribers = $this->subscribers->with(new Subscriber(SubscriptionId::fromString('s1'), RunMode::FROM_NOW, fn () => null));
         $result = $this->subscriptionEngine()->setup();
 
         $this->assertSubscriptions(
@@ -143,16 +138,16 @@ final class SubscriptionEngineTest extends TestCase
         $this->eventStore->append('event at #1');
         $this->eventStore->append('event at #2');
         $this->eventStore->append('event at #3');
-        $handler = new class implements EventHandler, ProvidesSetup {
+        $handler = new class {
 
             public bool $setupWasCalled = false;
-            public function __invoke(Event $event): void { /* no-op */ }
+            public function __invoke(MockEvent $event): void { /* no-op */ }
 
             public function setup(): void {
                 $this->setupWasCalled = true;
             }
         };
-        $this->subscribers = $this->subscribers->with(new Subscriber(SubscriptionId::fromString('s1'), RunMode::FROM_NOW, $handler));
+        $this->subscribers = $this->subscribers->with(new Subscriber(SubscriptionId::fromString('s1'), RunMode::FROM_NOW, $handler, $handler->setup(...)));
         $result = $this->subscriptionEngine()->setup();
 
         $this->assertSubscriptions(
@@ -161,7 +156,7 @@ final class SubscriptionEngineTest extends TestCase
 
         $this->assertEmittedEngineEvents(
             'SetupStarted: Start to setup',
-            'ActiveSubscriptionSetup: Active subscriber "' . $handler::class . '" for "s1" has been re-setup',
+            'ActiveSubscriptionSetup: Active subscriber for "s1" has been re-setup',
         );
         self::assertTrue($result->successful());
         self::assertTrue($handler->setupWasCalled);
@@ -174,8 +169,7 @@ final class SubscriptionEngineTest extends TestCase
         $this->eventStore->append('event at #1');
         $this->eventStore->append('event at #2');
         $this->eventStore->append('event at #3');
-        $handler = $this->createMock(EventHandler::class);
-        $this->subscribers = $this->subscribers->with(new Subscriber(SubscriptionId::fromString('s1'), RunMode::FROM_NOW, $handler));
+        $this->subscribers = $this->subscribers->with(new Subscriber(SubscriptionId::fromString('s1'), RunMode::FROM_NOW, fn () => null));
 
         $result = $this->subscriptionEngine()->boot();
 
@@ -185,18 +179,19 @@ final class SubscriptionEngineTest extends TestCase
         );
 
         $this->assertEmittedEngineEvents(
-            'CatchUpStarted: Start catching up subscriptions in states BOOTING.',
+            'CatchUpInitiated: Initiated catch-up of subscriptions in states BOOTING',
             'SubscriptionDetached: Subscription "s2" was marked detached',
+            'CatchUpStarted: Starting catch-up of 1 subscription from position 2',
+            'SubscriberHandledEvent: Subscriber for "s1" processed event "' . MockEvent::class . '" (position: 3)',
+            'CatchUpFinished: Finished catch-up of 1 subscription, processed 1 event (no errors)',
         );
         self::assertTrue($result->successful());
     }
 
     public function test_boot_commits_transaction_if_no_subscription_matches(): void
     {
-        $handler = $this->createMock(EventHandler::class);
-
         $subscriptionEngine = $this->subscriptionEngine();
-        $subscriptionEngine->onEvent(function (EngineEvent $event): void {
+        $subscriptionEngine->onEngineEvent(function (EngineEvent $event): void {
             if ($event instanceof NoSubscriptionsFound) {
                 self::assertTrue($this->subscriptionStore->transactionActive());
             }
@@ -205,7 +200,7 @@ final class SubscriptionEngineTest extends TestCase
         self::assertFalse($this->subscriptionStore->transactionActive());
 
         $this->assertEmittedEngineEvents(
-            'CatchUpStarted: Start catching up subscriptions in states BOOTING.',
+            'CatchUpInitiated: Initiated catch-up of subscriptions in states BOOTING',
             'NoSubscriptionsFound: No subscriptions found for criteria: {"ids":null,"status":["BOOTING"]}',
         );
         self::assertTrue($result->successful());
@@ -221,7 +216,7 @@ final class SubscriptionEngineTest extends TestCase
             $this->subscriptionStore,
             $this->subscribers,
         );
-        $engine->onEvent(fn (EngineEvent $event) => $this->emittedEngineEvents[] = $event);
+        $engine->onEngineEvent(fn (EngineEvent $event) => $this->emittedEngineEvents[] = $event);
         return $engine;
     }
 

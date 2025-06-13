@@ -2,13 +2,13 @@
 
 declare(strict_types=1);
 
-namespace Wwwision\SubscriptionEngine\Engine\Event;
+namespace Wwwision\SubscriptionEngine\Engine\EngineEvent;
 
-use Wwwision\SubscriptionEngine\Subscription\Subscription;
-
+/**
+ * @implements EngineEvent<void>
+ */
 final readonly class SetupStarted implements EngineEvent
 {
-
     public function __toString(): string
     {
         return 'Start to setup';
