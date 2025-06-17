@@ -23,6 +23,11 @@ final readonly class SubscriberSkippedEvent implements EngineEvent
     ) {
     }
 
+    public function logLevel(): int
+    {
+        return LOG_DEBUG;
+    }
+
     public function __toString(): string
     {
         return sprintf('Subscriber for "%s" skipped event "%s" (position: %d) because it is already father ahead (position: %d)', $this->subscription->id->value, get_debug_type($this->event), $this->eventPosition->value, $this->subscription->position->value);

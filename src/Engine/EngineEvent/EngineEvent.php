@@ -11,4 +11,8 @@ use Stringable;
  */
 interface EngineEvent extends Stringable
 {
+    /**
+     * @return int one of PHPs LOG_* constants
+     */
+    public function logLevel(): int;
 }

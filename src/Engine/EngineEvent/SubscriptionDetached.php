@@ -16,6 +16,11 @@ final readonly class SubscriptionDetached implements EngineEvent
     ) {
     }
 
+    public function logLevel(): int
+    {
+        return LOG_INFO;
+    }
+
     public function __toString(): string
     {
         return sprintf('Subscription "%s" was marked detached', $this->subscription->id->value);

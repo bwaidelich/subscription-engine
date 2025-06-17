@@ -19,6 +19,11 @@ final readonly class CatchUpFinished implements EngineEvent
     ) {
     }
 
+    public function logLevel(): int
+    {
+        return LOG_DEBUG;
+    }
+
     public function __toString(): string
     {
         $subscriptionsCount = $this->subscriptions->count();

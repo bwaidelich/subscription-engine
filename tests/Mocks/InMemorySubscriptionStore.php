@@ -20,6 +20,8 @@ final class InMemorySubscriptionStore implements SubscriptionStore
     private bool $setupCalled = false;
 
     private bool $transactionActive = false;
+    private bool $hasPendingChanges = false;
+    private bool $hasCommittedChanges = false;
 
     public function setup(): void
     {
@@ -42,11 +44,13 @@ final class InMemorySubscriptionStore implements SubscriptionStore
 
     public function add(Subscription $subscription): void
     {
+        $this->hasPendingChanges = true;
         $this->subscriptionsById[$subscription->id->value] = $subscription;
     }
 
     public function update(Subscription $subscription): void
     {
+        $this->hasPendingChanges = true;
         $this->subscriptionsById[$subscription->id->value] = $subscription;
     }
 
@@ -58,15 +62,37 @@ final class InMemorySubscriptionStore implements SubscriptionStore
     public function commit(): void
     {
         $this->transactionActive = false;
+        if ($this->hasPendingChanges) {
+            $this->hasCommittedChanges = true;
+            $this->hasPendingChanges = false;
+        }
     }
 
-    public function setupCalled(): bool
+    public function _setSubscriptions(Subscription ...$subscriptions): void
+    {
+        $this->subscriptionsById = [];
+        foreach ($subscriptions as $subscription) {
+            $this->subscriptionsById[$subscription->id->value] = $subscription;
+        }
+    }
+
+    public function _wasSetupCalled(): bool
     {
         return $this->setupCalled;
     }
 
-    public function transactionActive(): bool
+    public function _isTransactionActive(): bool
     {
         return $this->transactionActive;
+    }
+
+    public function _hasPendingChanges(): bool
+    {
+        return $this->hasPendingChanges;
+    }
+
+    public function _hasCommittedChanges(): bool
+    {
+        return $this->hasCommittedChanges;
     }
 }

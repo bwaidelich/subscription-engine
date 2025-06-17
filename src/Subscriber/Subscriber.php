@@ -26,8 +26,7 @@ final readonly class Subscriber
         RunMode $runMode = RunMode::FROM_BEGINNING,
         callable|null $setup = null,
         callable|null $reset = null,
-    ): self
-    {
+    ): self {
         if (is_string($id)) {
             $id = SubscriptionId::fromString($id);
         }

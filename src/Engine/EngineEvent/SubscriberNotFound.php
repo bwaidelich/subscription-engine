@@ -16,6 +16,11 @@ final readonly class SubscriberNotFound implements EngineEvent
     ) {
     }
 
+    public function logLevel(): int
+    {
+        return LOG_ERR;
+    }
+
     public function __toString(): string
     {
         return sprintf('Subscriber for "%s" not found', $this->subscription->id->value);

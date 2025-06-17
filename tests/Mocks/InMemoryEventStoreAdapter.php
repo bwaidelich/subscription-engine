@@ -20,7 +20,7 @@ final class InMemoryEventStoreAdapter implements EventStoreAdapter
 
     public function read(Position $startPosition): iterable
     {
-        yield from array_slice($this->events, $startPosition->value);
+        yield from array_slice($this->events, $startPosition->value - 1);
     }
 
     public function lastPosition(): Position

@@ -16,6 +16,11 @@ final readonly class SubscriptionDiscovered implements EngineEvent
     ) {
     }
 
+    public function logLevel(): int
+    {
+        return LOG_INFO;
+    }
+
     public function __toString(): string
     {
         return sprintf('New Subscriber "%s" was found and added to the subscription store', $this->subscription->id->value);

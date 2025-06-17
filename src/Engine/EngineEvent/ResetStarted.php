@@ -7,7 +7,7 @@ namespace Wwwision\SubscriptionEngine\Engine\EngineEvent;
 /**
  * @implements EngineEvent<void>
  */
-final readonly class SetupStarted implements EngineEvent
+final readonly class ResetStarted implements EngineEvent
 {
 
     public function logLevel(): int

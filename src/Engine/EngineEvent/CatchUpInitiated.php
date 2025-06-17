@@ -18,6 +18,11 @@ final readonly class CatchUpInitiated implements EngineEvent
     ) {
     }
 
+    public function logLevel(): int
+    {
+        return LOG_DEBUG;
+    }
+
     public function __toString(): string
     {
         return sprintf('Initiated catch-up of subscriptions in states %s', implode(',', $this->status->toStringArray()));

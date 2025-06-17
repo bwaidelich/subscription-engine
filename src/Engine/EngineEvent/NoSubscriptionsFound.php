@@ -16,6 +16,11 @@ final readonly class NoSubscriptionsFound implements EngineEvent
     ) {
     }
 
+    public function logLevel(): int
+    {
+        return LOG_INFO;
+    }
+
     public function __toString(): string
     {
         return sprintf('No subscriptions found for criteria: %s', json_encode($this->criteria));

@@ -10,7 +10,7 @@ use Wwwision\SubscriptionEngine\Subscription\Subscription;
 /**
  * @implements EngineEvent<void>
  */
-final readonly class FailedToSetupSubscriber implements EngineEvent
+final readonly class FailedToResetSubscriber implements EngineEvent
 {
     public function __construct(
         public Subscription $subscription,
@@ -25,6 +25,6 @@ final readonly class FailedToSetupSubscriber implements EngineEvent
 
     public function __toString(): string
     {
-        return sprintf('Subscriber for "%s" has an error in the setup method: %s', $this->subscription->id->value, $this->exception->getMessage());
+        return sprintf('Subscriber for "%s" has an error in the reset method: %s', $this->subscription->id->value, $this->exception->getMessage());
     }
 }

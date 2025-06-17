@@ -25,6 +25,11 @@ final readonly class SubscriberFailedToHandleEvent implements EngineEvent
     ) {
     }
 
+    public function logLevel(): int
+    {
+        return LOG_ERR;
+    }
+
     public function __toString(): string
     {
         return sprintf('Subscriber for "%s" failed to process event "%s" (position: %d): %s', $this->subscription->id->value, get_debug_type($this->event), $this->eventPosition->value, $this->exception->getMessage());

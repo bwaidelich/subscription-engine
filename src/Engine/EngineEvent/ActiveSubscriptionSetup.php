@@ -17,6 +17,11 @@ final readonly class ActiveSubscriptionSetup implements EngineEvent
     ) {
     }
 
+    public function logLevel(): int
+    {
+        return LOG_DEBUG;
+    }
+
     public function __toString(): string
     {
         return sprintf('Active subscriber for "%s" has been re-setup', $this->subscription->id->value);
