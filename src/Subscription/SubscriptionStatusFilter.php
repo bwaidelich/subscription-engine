@@ -5,11 +5,9 @@ declare(strict_types=1);
 namespace Wwwision\SubscriptionEngine\Subscription;
 
 use InvalidArgumentException;
+use JsonSerializable;
 
-/**
- * @implements \IteratorAggregate<SubscriptionStatus>
- */
-final class SubscriptionStatusFilter implements \IteratorAggregate
+final class SubscriptionStatusFilter implements JsonSerializable
 {
     /**
      * @param array<string, SubscriptionStatus> $statusByValue
@@ -30,10 +28,10 @@ final class SubscriptionStatusFilter implements \IteratorAggregate
                 $singleStatus = SubscriptionStatus::from($singleStatus);
             }
             if (!$singleStatus instanceof SubscriptionStatus) {
-                throw new InvalidArgumentException(sprintf('Expected instance of %s, got: %s', SubscriptionStatus::class, get_debug_type($singleStatus)), 1736159878);
+                throw new InvalidArgumentException(sprintf('Expected instance of %s, got: %s', SubscriptionStatus::class, get_debug_type($singleStatus)), 1737369465);
             }
             if (array_key_exists($singleStatus->value, $statusByValue)) {
-                throw new InvalidArgumentException(sprintf('Status "%s" is already part of this set', $singleStatus->value), 1736159880);
+                throw new InvalidArgumentException(sprintf('Status "%s" is already part of this set', $singleStatus->value), 1737369466);
             }
             $statusByValue[$singleStatus->value] = $singleStatus;
         }
@@ -42,17 +40,12 @@ final class SubscriptionStatusFilter implements \IteratorAggregate
 
     public static function any(): self
     {
-        return new self([]);
+        return self::fromArray(SubscriptionStatus::cases());
     }
 
-    public function getIterator(): \Traversable
+    public static function fromStatus(SubscriptionStatus $status): self
     {
-        yield from array_values($this->statusByValue);
-    }
-
-    public function isEmpty(): bool
-    {
-        return $this->statusByValue === [];
+        return new self([$status->value => $status]);
     }
 
     /**
@@ -61,5 +54,13 @@ final class SubscriptionStatusFilter implements \IteratorAggregate
     public function toStringArray(): array
     {
         return array_values(array_map(static fn (SubscriptionStatus $id) => $id->value, $this->statusByValue));
+    }
+
+    /**
+     * @return list<string>
+     */
+    public function jsonSerialize(): array
+    {
+        return $this->toStringArray();
     }
 }

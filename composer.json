@@ -43,9 +43,11 @@
         "test:phpstan": "phpstan",
         "test:cs": "phpcs --colors src",
         "test:cs:fix": "phpcbf --colors src",
+        "test:phpunit": "phpunit",
         "test": [
             "@test:phpstan",
-            "@test:cs"
+            "@test:cs",
+            "@test:phpunit"
         ]
     }
 }

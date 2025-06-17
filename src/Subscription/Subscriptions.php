@@ -95,7 +95,7 @@ final readonly class Subscriptions implements IteratorAggregate, Countable
      */
     public function map(Closure $callback): array
     {
-        return array_map($callback, $this->subscriptionsById);
+        return array_map($callback, array_values($this->subscriptionsById));
     }
 
     public function with(Subscription $subscription): self
