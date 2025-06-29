@@ -14,6 +14,7 @@ The [SubscriptionStore](./src/Store/SubscriptionStore.php) allows to persist and
 #### Implementations
 
 - [wwwision/subscription-engine-doctrine](https://packagist.org/packages/wwwision/subscription-engine-doctrine) provides a DBAL implementation that is compatible with MySQL/MariaDB, PostgreSQL and SQLite.
+- [ekvedaras/subscription-engine-illuminate](https://packagist.org/packages/ekvedaras/subscription-engine-illuminate) provides an implementation that uses [Laravel database](https://laravel.com/docs/12.x/database).
 
 ### `EventStoreAdapter`
 
