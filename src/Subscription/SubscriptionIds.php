@@ -11,7 +11,7 @@ use JsonSerializable;
 /**
  * @implements \IteratorAggregate<SubscriptionId>
  */
-final readonly class SubscriptionIds implements IteratorAggregate, Countable
+final readonly class SubscriptionIds implements IteratorAggregate, Countable, JsonSerializable
 {
     /**
      * @param array<string, SubscriptionId> $subscriptionIdsById
@@ -68,5 +68,13 @@ final readonly class SubscriptionIds implements IteratorAggregate, Countable
     public function toStringArray(): array
     {
         return array_values(array_map(static fn (SubscriptionId $id) => $id->value, $this->subscriptionIdsById));
+    }
+
+    /**
+     * @return list<string>
+     */
+    public function jsonSerialize(): array
+    {
+        return $this->toStringArray();
     }
 }

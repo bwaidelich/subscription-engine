@@ -352,7 +352,7 @@ final class SubscriptionEngineTest extends TestCase
         );
         $this->assertEmittedEngineEvents(
             'ResetStarted: Start to setup',
-            'NoSubscriptionsFound: No subscriptions found for criteria: {"ids":{},"status":["NEW","BOOTING","ACTIVE","DETACHED","ERROR"]}'
+            'NoSubscriptionsFound: No subscriptions found for criteria: {"ids":["s3"],"status":["NEW","BOOTING","ACTIVE","DETACHED","ERROR"]}'
         );
         self::assertTrue($result->successful());
         self::assertFalse($this->subscriptionStore->_hasPendingChanges(), 'Subscription store has pending changes');
