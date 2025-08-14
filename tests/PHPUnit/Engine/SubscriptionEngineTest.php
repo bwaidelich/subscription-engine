@@ -334,6 +334,122 @@ final class SubscriptionEngineTest extends TestCase
         self::assertSame('Event 2 in "s1": Exception from s1', $result->errors->getClampedMessage());
     }
 
+    public function test_catchUpActive_fails_if_called_recursively_without_criteria(): void
+    {
+        $subscriptionEngine = null;
+        $subscriber1 = Subscriber::create('s1', static function () use (&$subscriptionEngine) {
+            $subscriptionEngine->catchUpActive();
+        });
+        $this->subscriptionStore->_setSubscriptions(
+            Subscription::create(id: 's1', runMode: RunMode::FROM_BEGINNING, status: SubscriptionStatus::ACTIVE),
+        );
+        $subscriptionEngine = $this->subscriptionEngine($subscriber1);
+        $this->eventStore->append('event at #1');
+        $result = $subscriptionEngine->catchUpActive();
+        $this->assertSubscriptions(
+            ['id' => 's1', 'status' => 'ERROR', 'position' => 0, 'error' => 'Failed to catch up all subscriptions while catch up of subscription "s1" is still running'],
+        );
+        $this->assertEmittedEngineEvents(
+            'CatchUpInitiated: Initiated catch-up of subscriptions in states ACTIVE',
+            'CatchUpStarted: Starting catch-up of 1 subscription from position 1',
+            'CatchUpInitiated: Initiated catch-up of subscriptions in states ACTIVE',
+            'SubscriberFailedToHandleEvent: Subscriber for "s1" failed to process event "' . MockEvent::class . '" (position: 1): Failed to catch up all subscriptions while catch up of subscription "s1" is still running',
+            'CatchUpFinished: Finished catch-up of 1 subscription, processed 1 event (1 error)',
+        );
+        self::assertSame(1, $result->numberOfProcessedEvents);
+        self::assertSame('Event 1 in "s1": Failed to catch up all subscriptions while catch up of subscription "s1" is still running', $result->errors->getClampedMessage());
+    }
+
+    public function test_catchUpActive_fails_if_called_recursively_with_overlapping_criteria(): void
+    {
+        $subscriptionEngine = null;
+        $subscriber1 = Subscriber::create('s1', static function () use (&$subscriptionEngine) {
+            $subscriptionEngine->catchUpActive(SubscriptionEngineCriteria::create(ids: ['s3']));
+        });
+        $subscriber2 = Subscriber::create('s2', static function () use (&$subscriptionEngine) {
+            $subscriptionEngine->catchUpActive(SubscriptionEngineCriteria::create(ids: ['s3']));
+        });
+        $subscriber3 = Subscriber::create('s3', static fn () => null);
+        $this->subscriptionStore->_setSubscriptions(
+            Subscription::create(id: 's1', runMode: RunMode::FROM_BEGINNING, status: SubscriptionStatus::ACTIVE),
+            Subscription::create(id: 's2', runMode: RunMode::FROM_BEGINNING, status: SubscriptionStatus::ACTIVE),
+            Subscription::create(id: 's3', runMode: RunMode::FROM_BEGINNING, status: SubscriptionStatus::ACTIVE),
+        );
+        $subscriptionEngine = $this->subscriptionEngine($subscriber1, $subscriber2, $subscriber3);
+        $this->eventStore->append('event at #1');
+        $result = $subscriptionEngine->catchUpActive(SubscriptionEngineCriteria::create(ids: ['s3', 's1']));
+        $this->assertSubscriptions(
+            ['id' => 's1', 'status' => 'ERROR', 'position' => 0, 'error' => 'Failed to catch up subscription "s3" while catch up of subscriptions "s1", "s3" is still running'],
+            ['id' => 's2', 'status' => 'ACTIVE', 'position' => 0, 'error' => null],
+            ['id' => 's3', 'status' => 'ACTIVE', 'position' => 1, 'error' => null],
+        );
+        $this->assertEmittedEngineEvents(
+            'CatchUpInitiated: Initiated catch-up of subscriptions in states ACTIVE',
+            'CatchUpStarted: Starting catch-up of 2 subscriptions from position 1',
+            'CatchUpInitiated: Initiated catch-up of subscriptions in states ACTIVE',
+            'SubscriberFailedToHandleEvent: Subscriber for "s1" failed to process event "' . MockEvent::class . '" (position: 1): Failed to catch up subscription "s3" while catch up of subscriptions "s1", "s3" is still running',
+            'SubscriberHandledEvent: Subscriber for "s3" processed event "' . MockEvent::class . '" (position: 1)',
+            'CatchUpFinished: Finished catch-up of 2 subscriptions, processed 1 event (1 error)',
+        );
+        self::assertSame(1, $result->numberOfProcessedEvents);
+        self::assertSame('Event 1 in "s1": Failed to catch up subscription "s3" while catch up of subscriptions "s1", "s3" is still running', $result->errors->getClampedMessage());
+
+        $this->eventStore->append('event at #2');
+        $result = $subscriptionEngine->catchUpActive(SubscriptionEngineCriteria::create(ids: ['s3', 's2']));
+        $this->assertSubscriptions(
+            ['id' => 's1', 'status' => 'ERROR', 'position' => 0, 'error' => 'Failed to catch up subscription "s3" while catch up of subscriptions "s1", "s3" is still running'],
+            ['id' => 's2', 'status' => 'ERROR', 'position' => 0, 'error' => 'Failed to catch up subscription "s3" while catch up of subscriptions "s2", "s3" is still running'],
+            ['id' => 's3', 'status' => 'ACTIVE', 'position' => 2, 'error' => null],
+        );
+        $this->assertEmittedEngineEvents(
+            'CatchUpInitiated: Initiated catch-up of subscriptions in states ACTIVE',
+            'CatchUpStarted: Starting catch-up of 2 subscriptions from position 1',
+            'CatchUpInitiated: Initiated catch-up of subscriptions in states ACTIVE',
+            'SubscriberFailedToHandleEvent: Subscriber for "s2" failed to process event "' . MockEvent::class . '" (position: 1): Failed to catch up subscription "s3" while catch up of subscriptions "s2", "s3" is still running',
+            'SubscriberSkippedEvent: Subscriber for "s3" skipped event "' . MockEvent::class . '" (position: 1) because it is already father ahead (position: 1)',
+            'SubscriberHandledEvent: Subscriber for "s3" processed event "' . MockEvent::class . '" (position: 2)',
+            'CatchUpFinished: Finished catch-up of 2 subscriptions, processed 2 events (1 error)',
+        );
+        self::assertSame(2, $result->numberOfProcessedEvents);
+        self::assertSame('Event 1 in "s2": Failed to catch up subscription "s3" while catch up of subscriptions "s2", "s3" is still running', $result->errors->getClampedMessage());
+    }
+
+    public function test_catchUpActive_does_not_fail_if_called_recursively_with_non_overlapping_criteria(): void
+    {
+        $subscriptionEngine = null;
+        $subscriber1 = Subscriber::create('s1', static function () use (&$subscriptionEngine) {
+            $subscriptionEngine->catchUpActive(SubscriptionEngineCriteria::create(ids: ['s3']));
+        });
+        $subscriber2 = Subscriber::create('s2', static fn () => null);
+        $subscriber3 = Subscriber::create('s3', static fn () => null);
+        $this->subscriptionStore->_setSubscriptions(
+            Subscription::create(id: 's1', runMode: RunMode::FROM_BEGINNING, status: SubscriptionStatus::ACTIVE),
+            Subscription::create(id: 's2', runMode: RunMode::FROM_BEGINNING, status: SubscriptionStatus::ACTIVE),
+            Subscription::create(id: 's3', runMode: RunMode::FROM_BEGINNING, status: SubscriptionStatus::ACTIVE),
+        );
+        $subscriptionEngine = $this->subscriptionEngine($subscriber1, $subscriber2, $subscriber3);
+        $this->eventStore->append('event at #1');
+        $result = $subscriptionEngine->catchUpActive(SubscriptionEngineCriteria::create(ids: ['s2', 's1']));
+        $this->assertSubscriptions(
+            ['id' => 's1', 'status' => 'ACTIVE', 'position' => 1, 'error' => null],
+            ['id' => 's2', 'status' => 'ACTIVE', 'position' => 1, 'error' => null],
+            ['id' => 's3', 'status' => 'ACTIVE', 'position' => 1, 'error' => null],
+        );
+        $this->assertEmittedEngineEvents(
+            'CatchUpInitiated: Initiated catch-up of subscriptions in states ACTIVE',
+            'CatchUpStarted: Starting catch-up of 2 subscriptions from position 1',
+            'CatchUpInitiated: Initiated catch-up of subscriptions in states ACTIVE',
+            'CatchUpStarted: Starting catch-up of 1 subscription from position 1',
+            'SubscriberHandledEvent: Subscriber for "s3" processed event "' . MockEvent::class . '" (position: 1)',
+            'CatchUpFinished: Finished catch-up of 1 subscription, processed 1 event (no errors)',
+            'SubscriberHandledEvent: Subscriber for "s1" processed event "' . MockEvent::class . '" (position: 1)',
+            'SubscriberHandledEvent: Subscriber for "s2" processed event "' . MockEvent::class . '" (position: 1)',
+            'CatchUpFinished: Finished catch-up of 2 subscriptions, processed 1 event (no errors)',
+        );
+        self::assertSame(1, $result->numberOfProcessedEvents);
+        self::assertTrue($result->successful());
+    }
+
     public function test_reset_does_not_update_subscriptions_if_none_match(): void
     {
         $this->subscriptionStore->_setSubscriptions(
@@ -459,6 +575,7 @@ final class SubscriptionEngineTest extends TestCase
     private function assertEmittedEngineEvents(string ...$expectedEvents): void
     {
         self::assertSame($expectedEvents, array_map(static fn(EngineEvent $event) => sprintf('%s: %s', substr($event::class, strrpos($event::class, '\\') + 1), $event), $this->emittedEngineEvents));
+        $this->emittedEngineEvents = [];
     }
 
     private function assertSubscriptions(array ...$subscriptions): void
