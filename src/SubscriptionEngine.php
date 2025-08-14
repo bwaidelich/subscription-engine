@@ -27,6 +27,7 @@ use Wwwision\SubscriptionEngine\Engine\EngineEvent\SubscriptionDetached;
 use Wwwision\SubscriptionEngine\Engine\EngineEvent\SubscriptionDiscovered;
 use Wwwision\SubscriptionEngine\Engine\Error;
 use Wwwision\SubscriptionEngine\Engine\Errors;
+use Wwwision\SubscriptionEngine\Engine\Exception\RecursiveCatchUpException;
 use Wwwision\SubscriptionEngine\Engine\ProcessedResult;
 use Wwwision\SubscriptionEngine\Engine\Result;
 use Wwwision\SubscriptionEngine\Engine\SubscriptionEngineCriteria;
@@ -38,6 +39,7 @@ use Wwwision\SubscriptionEngine\Subscription\Position;
 use Wwwision\SubscriptionEngine\Subscription\RunMode;
 use Wwwision\SubscriptionEngine\Subscription\Subscription;
 use Wwwision\SubscriptionEngine\Subscription\SubscriptionError;
+use Wwwision\SubscriptionEngine\Subscription\SubscriptionIds;
 use Wwwision\SubscriptionEngine\Subscription\SubscriptionStatus;
 use Wwwision\SubscriptionEngine\Subscription\SubscriptionStatusFilter;
 
@@ -53,6 +55,8 @@ final class SubscriptionEngine
      */
     private array $engineEventSubscribers = [];
 
+    private SubscriptionIds $processingSubscriptions;
+
     /**
      * @param EventStoreAdapter<E> $eventStoreAdapter
      */
@@ -61,6 +65,7 @@ final class SubscriptionEngine
         private readonly SubscriptionStore $subscriptionStore,
         private readonly Subscribers $subscribers,
     ) {
+        $this->processingSubscriptions = SubscriptionIds::none();
     }
 
     /**
@@ -223,7 +228,11 @@ final class SubscriptionEngine
         $this->dispatchEngineEvent(new CatchUpInitiated($criteria, $status));
 
         $subscriptionCriteria = SubscriptionCriteria::forEngineCriteriaAndStatus($criteria, $status);
-
+        if (!$this->processingSubscriptions->isEmpty()) {
+            if ($subscriptionCriteria->ids === null || !$subscriptionCriteria->ids->intersection($this->processingSubscriptions)->isEmpty()) {
+                throw RecursiveCatchUpException::forSubscriptionIds($this->processingSubscriptions, $subscriptionCriteria->ids);
+            }
+        }
         $numberOfProcessedEvents = 0;
         /** @var array<Error> $errors */
         $errors = [];
@@ -231,6 +240,8 @@ final class SubscriptionEngine
         $this->subscriptionStore->beginTransaction();
 
         $subscriptionsToCatchup = $this->subscriptionStore->findByCriteriaForUpdate($subscriptionCriteria);
+        $processingSubscriptionsBackup = $this->processingSubscriptions;
+        $this->processingSubscriptions = $this->processingSubscriptions->merge($subscriptionsToCatchup->getIds());
         foreach ($subscriptionsToCatchup as $subscription) {
             if (!$this->subscribers->contain($subscription->id)) {
                 // mark detached subscriptions as we cannot handle them and exclude them from catchup
@@ -292,6 +303,7 @@ final class SubscriptionEngine
         $this->subscriptionStore->commit();
         $errorsVo = $errors !== [] ? Errors::fromArray($errors) : null;
         $this->dispatchEngineEvent(new CatchUpFinished($initialSubscriptionsToCatchup, $numberOfProcessedEvents, $errorsVo));
+        $this->processingSubscriptions = $processingSubscriptionsBackup;
         return $errorsVo === null ? ProcessedResult::success($numberOfProcessedEvents) : ProcessedResult::failed($numberOfProcessedEvents, $errorsVo);
     }
 

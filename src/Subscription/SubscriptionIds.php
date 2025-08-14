@@ -52,6 +52,11 @@ final readonly class SubscriptionIds implements IteratorAggregate, Countable, Js
         yield from array_values($this->subscriptionIdsById);
     }
 
+    public function isEmpty(): bool
+    {
+        return $this->subscriptionIdsById === [];
+    }
+
     public function count(): int
     {
         return count($this->subscriptionIdsById);
@@ -60,6 +65,16 @@ final readonly class SubscriptionIds implements IteratorAggregate, Countable, Js
     public function contain(SubscriptionId $id): bool
     {
         return array_key_exists($id->value, $this->subscriptionIdsById);
+    }
+
+    public function intersection(self $other): self
+    {
+        return new self(array_intersect_key($this->subscriptionIdsById, $other->subscriptionIdsById));
+    }
+
+    public function merge(self $other): self
+    {
+        return new self(array_replace($this->subscriptionIdsById, $other->subscriptionIdsById));
     }
 
     /**
