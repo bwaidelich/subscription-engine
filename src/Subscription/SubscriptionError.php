@@ -20,6 +20,23 @@ final readonly class SubscriptionError
 
     public static function fromPreviousStatusAndException(SubscriptionStatus $previousStatus, Throwable $error): self
     {
-        return new self($error->getMessage(), $previousStatus, $error->getTraceAsString());
+        $message = self::getExceptionOutput($error);
+        $previous = $error->getPrevious();
+        while ($previous !== null) {
+            $message .= "\n\nCaused by\n" . self::getExceptionOutput($previous);
+            $previous = $previous->getPrevious();
+        }
+        return new self($message, $previousStatus, $error->getTraceAsString());
+    }
+
+    private static function getExceptionOutput(Throwable $exception): string
+    {
+        return sprintf(
+            '%s: %s in file %s on line %d',
+            get_class($exception),
+            $exception->getMessage(),
+            $exception->getFile(),
+            $exception->getLine()
+        );
     }
 }
