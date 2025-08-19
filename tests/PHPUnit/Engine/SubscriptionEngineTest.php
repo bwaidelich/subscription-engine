@@ -8,6 +8,7 @@ use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\TestCase;
 use Wwwision\SubscriptionEngine\Engine\EngineEvent\EngineEvent;
 use Wwwision\SubscriptionEngine\Engine\EngineEvent\NoSubscriptionsFound;
+use Wwwision\SubscriptionEngine\Engine\Exception\RecursiveCatchUpException;
 use Wwwision\SubscriptionEngine\Engine\SubscriptionEngineCriteria;
 use Wwwision\SubscriptionEngine\Store\SubscriptionCriteria;
 use Wwwision\SubscriptionEngine\Subscriber\Subscriber;
@@ -88,7 +89,7 @@ final class SubscriptionEngineTest extends TestCase
         $result = $this->subscriptionEngine($subscriber)->setup();
 
         $this->assertSubscriptions(
-            ['id' => 's1', 'status' => 'ERROR', 'position' => 0, 'error' => 'Just testing'],
+            ['id' => 's1', 'status' => 'ERROR', 'position' => 0, 'error' => 'Error: Just testing in file ' . __FILE__ . ' on line ' . (__LINE__ - 7)],
         );
 
         $this->assertEmittedEngineEvents(
@@ -288,9 +289,11 @@ final class SubscriptionEngineTest extends TestCase
     public function test_catchUpActive_with_failed_subscribers(): void
     {
         $handler1Invocations = 0;
-        $subscriber1 = Subscriber::create(SubscriptionId::fromString('s1'), function () use (&$handler1Invocations) {
+        $handler1ExceptionLineNumber = 0;
+        $subscriber1 = Subscriber::create(SubscriptionId::fromString('s1'), function () use (&$handler1Invocations, &$handler1ExceptionLineNumber) {
             $handler1Invocations++;
             if ($handler1Invocations > 1) {
+                $handler1ExceptionLineNumber = __LINE__ + 1;
                 throw new \RuntimeException('Exception from s1');
             }
         });
@@ -317,7 +320,7 @@ final class SubscriptionEngineTest extends TestCase
         $result = $subscriptionEngine->catchUpActive();
 
         $this->assertSubscriptions(
-            ['id' => 's1', 'status' => 'ERROR', 'position' => 1, 'error' => 'Exception from s1'],
+            ['id' => 's1', 'status' => 'ERROR', 'position' => 1, 'error' => 'RuntimeException: Exception from s1 in file ' . __FILE__ . ' on line ' . $handler1ExceptionLineNumber],
             ['id' => 's2', 'status' => 'ACTIVE', 'position' => 2, 'error' => null],
             ['id' => 's3', 'status' => 'BOOTING', 'position' => 0, 'error' => null],
         );
@@ -347,7 +350,7 @@ final class SubscriptionEngineTest extends TestCase
         $this->eventStore->append('event at #1');
         $result = $subscriptionEngine->catchUpActive();
         $this->assertSubscriptions(
-            ['id' => 's1', 'status' => 'ERROR', 'position' => 0, 'error' => 'Failed to catch up all subscriptions while catch up of subscription "s1" is still running'],
+            ['id' => 's1', 'status' => 'ERROR', 'position' => 0, 'error' => RecursiveCatchUpException::class . ': Failed to catch up all subscriptions while catch up of subscription "s1" is still running in file ' . realpath(__DIR__ . '/../../../src/Engine/Exception/RecursiveCatchUpException.php') . ' on line 23'],
         );
         $this->assertEmittedEngineEvents(
             'CatchUpInitiated: Initiated catch-up of subscriptions in states ACTIVE',
@@ -379,7 +382,7 @@ final class SubscriptionEngineTest extends TestCase
         $this->eventStore->append('event at #1');
         $result = $subscriptionEngine->catchUpActive(SubscriptionEngineCriteria::create(ids: ['s3', 's1']));
         $this->assertSubscriptions(
-            ['id' => 's1', 'status' => 'ERROR', 'position' => 0, 'error' => 'Failed to catch up subscription "s3" while catch up of subscriptions "s1", "s3" is still running'],
+            ['id' => 's1', 'status' => 'ERROR', 'position' => 0, 'error' => RecursiveCatchUpException::class . ': Failed to catch up subscription "s3" while catch up of subscriptions "s1", "s3" is still running in file ' . realpath(__DIR__ . '/../../../src/Engine/Exception/RecursiveCatchUpException.php') . ' on line 23'],
             ['id' => 's2', 'status' => 'ACTIVE', 'position' => 0, 'error' => null],
             ['id' => 's3', 'status' => 'ACTIVE', 'position' => 1, 'error' => null],
         );
@@ -397,8 +400,8 @@ final class SubscriptionEngineTest extends TestCase
         $this->eventStore->append('event at #2');
         $result = $subscriptionEngine->catchUpActive(SubscriptionEngineCriteria::create(ids: ['s3', 's2']));
         $this->assertSubscriptions(
-            ['id' => 's1', 'status' => 'ERROR', 'position' => 0, 'error' => 'Failed to catch up subscription "s3" while catch up of subscriptions "s1", "s3" is still running'],
-            ['id' => 's2', 'status' => 'ERROR', 'position' => 0, 'error' => 'Failed to catch up subscription "s3" while catch up of subscriptions "s2", "s3" is still running'],
+            ['id' => 's1', 'status' => 'ERROR', 'position' => 0, 'error' => RecursiveCatchUpException::class . ': Failed to catch up subscription "s3" while catch up of subscriptions "s1", "s3" is still running in file ' . realpath(__DIR__ . '/../../../src/Engine/Exception/RecursiveCatchUpException.php') . ' on line 23'],
+            ['id' => 's2', 'status' => 'ERROR', 'position' => 0, 'error' => RecursiveCatchUpException::class . ': Failed to catch up subscription "s3" while catch up of subscriptions "s2", "s3" is still running in file ' . realpath(__DIR__ . '/../../../src/Engine/Exception/RecursiveCatchUpException.php') . ' on line 23'],
             ['id' => 's3', 'status' => 'ACTIVE', 'position' => 2, 'error' => null],
         );
         $this->assertEmittedEngineEvents(
