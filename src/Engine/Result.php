@@ -21,6 +21,7 @@ final readonly class Result
         return new self($errors);
     }
 
+    /** @phpstan-assert-if-true null $this->errors */
     public function successful(): bool
     {
         return $this->errors === null;
