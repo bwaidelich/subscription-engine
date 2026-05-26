@@ -15,6 +15,8 @@ interface SubscriptionStore
 {
     public function setup(): void;
 
+    public function findByCriteria(SubscriptionCriteria $criteria): Subscriptions;
+
     public function findByCriteriaForUpdate(SubscriptionCriteria $criteria): Subscriptions;
 
     public function add(Subscription $subscription): void;

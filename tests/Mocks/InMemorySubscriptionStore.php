@@ -28,7 +28,17 @@ final class InMemorySubscriptionStore implements SubscriptionStore
         $this->setupCalled = true;
     }
 
+    public function findByCriteria(SubscriptionCriteria $criteria): Subscriptions
+    {
+        return $this->filterByCriteria($criteria);
+    }
+
     public function findByCriteriaForUpdate(SubscriptionCriteria $criteria): Subscriptions
+    {
+        return $this->filterByCriteria($criteria);
+    }
+
+    private function filterByCriteria(SubscriptionCriteria $criteria): Subscriptions
     {
         $filteredSubscriptions = array_filter($this->subscriptionsById, static function (Subscription $subscription) use ($criteria) {
             if ($criteria->ids !== null && !in_array($subscription->id->value, $criteria->ids->toStringArray(), true)) {

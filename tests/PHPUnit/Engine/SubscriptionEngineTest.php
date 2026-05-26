@@ -541,6 +541,89 @@ final class SubscriptionEngineTest extends TestCase
         self::assertTrue($result->successful());
     }
 
+    public function test_getSubscriptions_returns_empty_set_if_no_subscriptions_exist(): void
+    {
+        $subscriptions = $this->subscriptionEngine()->getSubscriptions();
+        self::assertTrue($subscriptions->isEmpty());
+    }
+
+    public function test_getSubscriptions_returns_all_subscriptions_without_criteria(): void
+    {
+        $this->subscriptionStore->_setSubscriptions(
+            Subscription::create(id: 's1', runMode: RunMode::FROM_NOW, status: SubscriptionStatus::ACTIVE),
+            Subscription::create(id: 's2', runMode: RunMode::FROM_BEGINNING, status: SubscriptionStatus::BOOTING),
+            Subscription::create(id: 's3', runMode: RunMode::FROM_NOW, status: SubscriptionStatus::DETACHED),
+        );
+
+        $subscriptions = $this->subscriptionEngine()->getSubscriptions();
+
+        self::assertSame(['s1', 's2', 's3'], $subscriptions->getIds()->toStringArray());
+    }
+
+    public function test_getSubscriptions_filters_by_criteria(): void
+    {
+        $this->subscriptionStore->_setSubscriptions(
+            Subscription::create(id: 's1', runMode: RunMode::FROM_NOW, status: SubscriptionStatus::ACTIVE),
+            Subscription::create(id: 's2', runMode: RunMode::FROM_BEGINNING, status: SubscriptionStatus::BOOTING),
+            Subscription::create(id: 's3', runMode: RunMode::FROM_NOW, status: SubscriptionStatus::DETACHED),
+        );
+
+        $subscriptions = $this->subscriptionEngine()->getSubscriptions(SubscriptionEngineCriteria::create(ids: ['s1', 's3']));
+
+        self::assertSame(['s1', 's3'], $subscriptions->getIds()->toStringArray());
+    }
+
+    public function test_getSubscriptions_returns_subscriptions_of_any_status(): void
+    {
+        $this->subscriptionStore->_setSubscriptions(
+            Subscription::create(id: 's1', runMode: RunMode::FROM_NOW, status: SubscriptionStatus::NEW),
+            Subscription::create(id: 's2', runMode: RunMode::FROM_NOW, status: SubscriptionStatus::BOOTING),
+            Subscription::create(id: 's3', runMode: RunMode::FROM_NOW, status: SubscriptionStatus::ACTIVE),
+            Subscription::create(id: 's4', runMode: RunMode::FROM_NOW, status: SubscriptionStatus::DETACHED),
+            Subscription::create(id: 's5', runMode: RunMode::FROM_NOW, status: SubscriptionStatus::ERROR),
+        );
+
+        $subscriptions = $this->subscriptionEngine()->getSubscriptions();
+
+        self::assertSame(['s1', 's2', 's3', 's4', 's5'], $subscriptions->getIds()->toStringArray());
+    }
+
+    public function test_getSubscription_returns_null_if_no_subscription_with_given_id_exists(): void
+    {
+        $this->subscriptionStore->_setSubscriptions(
+            Subscription::create(id: 's1', runMode: RunMode::FROM_NOW, status: SubscriptionStatus::ACTIVE),
+        );
+
+        self::assertNull($this->subscriptionEngine()->getSubscription(SubscriptionId::fromString('non-existing')));
+    }
+
+    public function test_getSubscription_returns_matching_subscription(): void
+    {
+        $this->subscriptionStore->_setSubscriptions(
+            Subscription::create(id: 's1', runMode: RunMode::FROM_NOW, status: SubscriptionStatus::ACTIVE),
+            Subscription::create(id: 's2', runMode: RunMode::FROM_BEGINNING, status: SubscriptionStatus::BOOTING)->with(position: Position::fromInteger(7)),
+        );
+
+        $subscription = $this->subscriptionEngine()->getSubscription(SubscriptionId::fromString('s2'));
+
+        self::assertNotNull($subscription);
+        self::assertSame('s2', $subscription->id->value);
+        self::assertSame(SubscriptionStatus::BOOTING, $subscription->status);
+        self::assertSame(7, $subscription->position->value);
+    }
+
+    public function test_getSubscription_returns_subscription_in_any_status(): void
+    {
+        $this->subscriptionStore->_setSubscriptions(
+            Subscription::create(id: 's1', runMode: RunMode::FROM_NOW, status: SubscriptionStatus::DETACHED),
+        );
+
+        $subscription = $this->subscriptionEngine()->getSubscription(SubscriptionId::fromString('s1'));
+
+        self::assertNotNull($subscription);
+        self::assertSame(SubscriptionStatus::DETACHED, $subscription->status);
+    }
+
     public function test_reset_handles_errors_in_reset_function(): void
     {
         $this->subscriptionStore->_setSubscriptions(
