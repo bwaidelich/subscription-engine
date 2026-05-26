@@ -39,7 +39,9 @@ use Wwwision\SubscriptionEngine\Subscription\Position;
 use Wwwision\SubscriptionEngine\Subscription\RunMode;
 use Wwwision\SubscriptionEngine\Subscription\Subscription;
 use Wwwision\SubscriptionEngine\Subscription\SubscriptionError;
+use Wwwision\SubscriptionEngine\Subscription\SubscriptionId;
 use Wwwision\SubscriptionEngine\Subscription\SubscriptionIds;
+use Wwwision\SubscriptionEngine\Subscription\Subscriptions;
 use Wwwision\SubscriptionEngine\Subscription\SubscriptionStatus;
 use Wwwision\SubscriptionEngine\Subscription\SubscriptionStatusFilter;
 
@@ -133,6 +135,22 @@ final class SubscriptionEngine
             }
         }
         return $errors === [] ? Result::success() : Result::failed(Errors::fromArray($errors));
+    }
+
+    public function getSubscriptions(SubscriptionEngineCriteria|null $criteria = null): Subscriptions
+    {
+        $subscriptionCriteria = SubscriptionCriteria::forEngineCriteriaAndStatus($criteria ??= SubscriptionEngineCriteria::noConstraints(), SubscriptionStatusFilter::any());
+        return $this->subscriptionStore->findByCriteria($subscriptionCriteria);
+    }
+
+    public function getSubscription(SubscriptionId $subscriptionId): Subscription|null
+    {
+        $subscriptionCriteria = SubscriptionCriteria::forEngineCriteriaAndStatus(SubscriptionEngineCriteria::create([$subscriptionId]), SubscriptionStatusFilter::any());
+        $subscriptions = $this->subscriptionStore->findByCriteria($subscriptionCriteria);
+        if (!$subscriptions->contain($subscriptionId)) {
+            return null;
+        }
+        return $subscriptions->get($subscriptionId);
     }
 
     // ------------------------------
