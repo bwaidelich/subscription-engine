@@ -5,10 +5,12 @@ declare(strict_types=1);
 namespace Wwwision\SubscriptionEngine\Tests\PHPUnit\Engine;
 
 use PHPUnit\Framework\Attributes\CoversClass;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use Wwwision\SubscriptionEngine\Engine\EngineEvent\EngineEvent;
 use Wwwision\SubscriptionEngine\Engine\EngineEvent\NoSubscriptionsFound;
 use Wwwision\SubscriptionEngine\Engine\Exception\RecursiveCatchUpException;
+use Wwwision\SubscriptionEngine\Engine\Exception\UnknownSubscriptionIdsException;
 use Wwwision\SubscriptionEngine\Engine\SubscriptionEngineCriteria;
 use Wwwision\SubscriptionEngine\Store\SubscriptionCriteria;
 use Wwwision\SubscriptionEngine\Subscriber\Subscriber;
@@ -462,6 +464,7 @@ final class SubscriptionEngineTest extends TestCase
         $subscriptionEngine = $this->subscriptionEngine(
             Subscriber::create(id: 's1', handler: fn () => null, reset: fn () => null),
             Subscriber::create(id: 's2', handler: fn () => null),
+            Subscriber::create(id: 's3', handler: fn () => null),
         );
         $result = $subscriptionEngine->reset(SubscriptionEngineCriteria::create(ids: ['s3']));
 
@@ -646,6 +649,73 @@ final class SubscriptionEngineTest extends TestCase
 
     // ---------------------
 
+
+    public static function engineMethods(): iterable
+    {
+        yield 'setup' => ['setup'];
+        yield 'boot' => ['boot'];
+        yield 'catchUpActive' => ['catchUpActive'];
+        yield 'reset' => ['reset'];
+    }
+
+    #[DataProvider('engineMethods')]
+    public function test_engine_methods_throw_for_an_unknown_subscription_id(string $method): void
+    {
+        $this->subscriptionStore->_setSubscriptions(Subscription::create(id: 's1', runMode: RunMode::FROM_BEGINNING, status: SubscriptionStatus::BOOTING));
+        $subscriber = Subscriber::create(SubscriptionId::fromString('s1'), fn() => null);
+        $subscriptionEngine = $this->subscriptionEngine($subscriber);
+
+        try {
+            $subscriptionEngine->{$method}(SubscriptionEngineCriteria::create(['s1', 's2']));
+            self::fail(sprintf('Expected %s to be thrown', UnknownSubscriptionIdsException::class));
+        } catch (UnknownSubscriptionIdsException $exception) {
+            self::assertSame('Unknown subscription id "s2"', $exception->getMessage());
+        }
+
+        $this->assertSubscriptions(
+            ['id' => 's1', 'status' => 'BOOTING', 'position' => 0, 'error' => null],
+        );
+        $this->assertEmittedEngineEvents();
+    }
+
+    #[DataProvider('engineMethods')]
+    public function test_engine_methods_throw_for_unknown_subscription_ids(string $method): void
+    {
+        $this->subscriptionStore->_setSubscriptions(Subscription::create(id: 's1', runMode: RunMode::FROM_BEGINNING, status: SubscriptionStatus::BOOTING));
+        $subscriber = Subscriber::create(SubscriptionId::fromString('s1'), fn() => null);
+        $subscriptionEngine = $this->subscriptionEngine($subscriber);
+
+        try {
+            $subscriptionEngine->{$method}(SubscriptionEngineCriteria::create(['s1', 's2', 's3']));
+            self::fail(sprintf('Expected %s to be thrown', UnknownSubscriptionIdsException::class));
+        } catch (UnknownSubscriptionIdsException $exception) {
+            self::assertSame('Unknown subscription ids "s2", "s3"', $exception->getMessage());
+        }
+
+        $this->assertSubscriptions(
+            ['id' => 's1', 'status' => 'BOOTING', 'position' => 0, 'error' => null],
+        );
+        $this->assertEmittedEngineEvents();
+    }
+
+    #[DataProvider('engineMethods')]
+    public function test_engine_methods_throw_for_the_id_of_a_detached_subscription(string $method): void
+    {
+        $this->subscriptionStore->_setSubscriptions(Subscription::create(id: 's1', runMode: RunMode::FROM_BEGINNING, status: SubscriptionStatus::DETACHED));
+        $subscriptionEngine = $this->subscriptionEngine();
+
+        try {
+            $subscriptionEngine->{$method}(SubscriptionEngineCriteria::create(['s1']));
+            self::fail(sprintf('Expected %s to be thrown', UnknownSubscriptionIdsException::class));
+        } catch (UnknownSubscriptionIdsException $exception) {
+            self::assertSame('Unknown subscription id "s1"', $exception->getMessage());
+        }
+
+        $this->assertSubscriptions(
+            ['id' => 's1', 'status' => 'DETACHED', 'position' => 0, 'error' => null],
+        );
+        $this->assertEmittedEngineEvents();
+    }
 
     private function subscriptionEngine(Subscriber ...$subscribers): SubscriptionEngine
     {

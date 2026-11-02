@@ -28,6 +28,7 @@ use Wwwision\SubscriptionEngine\Engine\EngineEvent\SubscriptionDiscovered;
 use Wwwision\SubscriptionEngine\Engine\Error;
 use Wwwision\SubscriptionEngine\Engine\Errors;
 use Wwwision\SubscriptionEngine\Engine\Exception\RecursiveCatchUpException;
+use Wwwision\SubscriptionEngine\Engine\Exception\UnknownSubscriptionIdsException;
 use Wwwision\SubscriptionEngine\Engine\ProcessedResult;
 use Wwwision\SubscriptionEngine\Engine\Result;
 use Wwwision\SubscriptionEngine\Engine\SubscriptionEngineCriteria;
@@ -81,6 +82,7 @@ final class SubscriptionEngine
     public function setup(SubscriptionEngineCriteria|null $criteria = null): Result
     {
         $criteria ??= SubscriptionEngineCriteria::noConstraints();
+        $this->assertKnownSubscriptionIds($criteria);
         $this->dispatchEngineEvent(new SetupStarted());
 
         $this->subscriptionStore->setup();
@@ -120,6 +122,7 @@ final class SubscriptionEngine
     public function reset(SubscriptionEngineCriteria|null $criteria = null): Result
     {
         $criteria ??= SubscriptionEngineCriteria::noConstraints();
+        $this->assertKnownSubscriptionIds($criteria);
         $this->dispatchEngineEvent(new ResetStarted());
         $subscriptionCriteria = SubscriptionCriteria::forEngineCriteriaAndStatus($criteria, SubscriptionStatusFilter::any());
         $subscriptions = $this->subscriptionStore->findByCriteriaForUpdate($subscriptionCriteria);
@@ -154,6 +157,25 @@ final class SubscriptionEngine
     }
 
     // ------------------------------
+
+    /**
+     * @throws UnknownSubscriptionIdsException
+     */
+    private function assertKnownSubscriptionIds(SubscriptionEngineCriteria $criteria): void
+    {
+        if ($criteria->ids === null) {
+            return;
+        }
+        $unknownSubscriptionIds = [];
+        foreach ($criteria->ids as $subscriptionId) {
+            if (!$this->subscribers->contain($subscriptionId)) {
+                $unknownSubscriptionIds[] = $subscriptionId;
+            }
+        }
+        if ($unknownSubscriptionIds !== []) {
+            throw UnknownSubscriptionIdsException::forSubscriptionIds(SubscriptionIds::fromArray($unknownSubscriptionIds));
+        }
+    }
 
     /**
      * Find all subscribers that don't have a corresponding subscription.
@@ -243,6 +265,7 @@ final class SubscriptionEngine
 
     private function catchUpSubscriptions(SubscriptionEngineCriteria $criteria, SubscriptionStatusFilter $status): ProcessedResult
     {
+        $this->assertKnownSubscriptionIds($criteria);
         $this->dispatchEngineEvent(new CatchUpInitiated($criteria, $status));
 
         $subscriptionCriteria = SubscriptionCriteria::forEngineCriteriaAndStatus($criteria, $status);
