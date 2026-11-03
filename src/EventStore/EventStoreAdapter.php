@@ -12,11 +12,12 @@ use Wwwision\SubscriptionEngine\Subscription\Position;
 interface EventStoreAdapter
 {
     /**
-     * Read events from a given starting position (0 = from beginning)
+     * Read events from a given starting position (0 = from beginning) in the order of their position
      *
+     * @param int|null $limit If specified, at most this number of events must be returned. NULL reads to the end of the event log
      * @return iterable<E>
      */
-    public function read(Position $startPosition): iterable;
+    public function read(Position $startPosition, int|null $limit = null): iterable;
 
     /**
      * Position of the last event in the global event stream

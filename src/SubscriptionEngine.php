@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Wwwision\SubscriptionEngine;
 
+use InvalidArgumentException;
 use Throwable;
 use Wwwision\SubscriptionEngine\Engine\EngineEvent\ActiveSubscriptionSetup;
 use Wwwision\SubscriptionEngine\Engine\EngineEvent\CatchUpFinished;
@@ -107,16 +108,16 @@ final class SubscriptionEngine
         return $errors === [] ? Result::success() : Result::failed(Errors::fromArray($errors));
     }
 
-    public function boot(SubscriptionEngineCriteria|null $criteria = null): ProcessedResult
+    public function boot(SubscriptionEngineCriteria|null $criteria = null, int|null $limit = null): ProcessedResult
     {
         $criteria ??= SubscriptionEngineCriteria::noConstraints();
-        return $this->catchUpSubscriptions($criteria, SubscriptionStatusFilter::fromStatus(SubscriptionStatus::BOOTING));
+        return $this->catchUpSubscriptions($criteria, SubscriptionStatusFilter::fromStatus(SubscriptionStatus::BOOTING), $limit);
     }
 
-    public function catchUpActive(SubscriptionEngineCriteria|null $criteria = null): ProcessedResult
+    public function catchUpActive(SubscriptionEngineCriteria|null $criteria = null, int|null $limit = null): ProcessedResult
     {
         $criteria ??= SubscriptionEngineCriteria::noConstraints();
-        return $this->catchUpSubscriptions($criteria, SubscriptionStatusFilter::fromStatus(SubscriptionStatus::ACTIVE));
+        return $this->catchUpSubscriptions($criteria, SubscriptionStatusFilter::fromStatus(SubscriptionStatus::ACTIVE), $limit);
     }
 
     public function reset(SubscriptionEngineCriteria|null $criteria = null): Result
@@ -263,8 +264,11 @@ final class SubscriptionEngine
         return null;
     }
 
-    private function catchUpSubscriptions(SubscriptionEngineCriteria $criteria, SubscriptionStatusFilter $status): ProcessedResult
+    private function catchUpSubscriptions(SubscriptionEngineCriteria $criteria, SubscriptionStatusFilter $status, int|null $limit): ProcessedResult
     {
+        if ($limit !== null && $limit < 1) {
+            throw new InvalidArgumentException(sprintf('limit has to be a positive integer, got: %d', $limit), 1793750400);
+        }
         $this->assertKnownSubscriptionIds($criteria);
         $this->dispatchEngineEvent(new CatchUpInitiated($criteria, $status));
 
@@ -306,7 +310,12 @@ final class SubscriptionEngine
         /** @var array<string,Position> $highestPositionForSubscriber */
         $highestPositionForSubscriber = [];
 
-        foreach ($this->eventStoreAdapter->read($startPosition) as $event) {
+        $hasPendingEvents = false;
+        foreach ($this->eventStoreAdapter->read($startPosition, $limit !== null ? $limit + 1 : null) as $event) {
+            if ($numberOfProcessedEvents === $limit) {
+                $hasPendingEvents = true;
+                break;
+            }
             $eventPosition = $this->eventStoreAdapter->eventPosition($event);
             foreach ($subscriptionsToCatchup as $subscription) {
                 $subscriber = $this->subscribers->get($subscription->id);
@@ -334,19 +343,27 @@ final class SubscriptionEngine
             }
             $numberOfProcessedEvents++;
         }
+        // without any remaining subscription, calling the catch-up again could not process more events
+        $hasPendingEvents = $hasPendingEvents && !$subscriptionsToCatchup->isEmpty();
         foreach ($subscriptionsToCatchup as $subscription) {
-            // after catchup mark all subscriptions as active, so they are triggered automatically now.
             // The position will be set to the one the subscriber handled last, or if no events were in the stream, and we booted we keep the persisted position
-            $this->subscriptionStore->update($subscription->with(status: SubscriptionStatus::ACTIVE, position: $highestPositionForSubscriber[$subscription->id->value] ?? $subscription->position));
+            $position = $highestPositionForSubscriber[$subscription->id->value] ?? $subscription->position;
+            if ($hasPendingEvents) {
+                // a partial catch-up keeps the status: Booting subscriptions must not be triggered automatically until they reached the end of the event log
+                $this->subscriptionStore->update($subscription->with(position: $position));
+                continue;
+            }
+            // after catchup mark all subscriptions as active, so they are triggered automatically now.
+            $this->subscriptionStore->update($subscription->with(status: SubscriptionStatus::ACTIVE, position: $position));
             if ($subscription->status !== SubscriptionStatus::ACTIVE) {
                 $this->dispatchEngineEvent(new SubscriptionActivated($subscription, $subscription->status));
             }
         }
         $this->subscriptionStore->commit();
         $errorsVo = $errors !== [] ? Errors::fromArray($errors) : null;
-        $this->dispatchEngineEvent(new CatchUpFinished($initialSubscriptionsToCatchup, $numberOfProcessedEvents, $errorsVo));
+        $this->dispatchEngineEvent(new CatchUpFinished($initialSubscriptionsToCatchup, $numberOfProcessedEvents, $errorsVo, $hasPendingEvents));
         $this->processingSubscriptions = $processingSubscriptionsBackup;
-        return $errorsVo === null ? ProcessedResult::success($numberOfProcessedEvents) : ProcessedResult::failed($numberOfProcessedEvents, $errorsVo);
+        return $errorsVo === null ? ProcessedResult::success($numberOfProcessedEvents, $hasPendingEvents) : ProcessedResult::failed($numberOfProcessedEvents, $errorsVo, $hasPendingEvents);
     }
 
     /**

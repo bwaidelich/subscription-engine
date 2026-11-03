@@ -731,6 +731,263 @@ final class SubscriptionEngineTest extends TestCase
         self::assertSame(0, $result->numberOfProcessedEvents);
     }
 
+    public function test_catchUpActive_with_limit_stops_after_limit_and_reports_pending_events(): void
+    {
+        $handledEvents = [];
+        $subscriber = Subscriber::create(SubscriptionId::fromString('s1'), function (MockEvent $event) use (&$handledEvents) {
+            $handledEvents[] = $event->position->value;
+        });
+        $this->subscriptionStore->_setSubscriptions(
+            Subscription::create(id: 's1', runMode: RunMode::FROM_BEGINNING, status: SubscriptionStatus::ACTIVE),
+        );
+        $this->eventStore->append('event at #1');
+        $this->eventStore->append('event at #2');
+        $this->eventStore->append('event at #3');
+
+        $result = $this->subscriptionEngine($subscriber)->catchUpActive(limit: 2);
+
+        self::assertSame([1, 2], $handledEvents);
+        self::assertSame(2, $result->numberOfProcessedEvents);
+        self::assertTrue($result->hasPendingEvents);
+        self::assertFalse($this->subscriptionStore->_isTransactionActive());
+        $this->assertSubscriptions(
+            ['id' => 's1', 'status' => 'ACTIVE', 'position' => 2, 'error' => null],
+        );
+        $this->assertEmittedEngineEvents(
+            'CatchUpInitiated: Initiated catch-up of subscriptions in states ACTIVE',
+            'CatchUpStarted: Starting catch-up of 1 subscription from position 1',
+            'SubscriberHandledEvent: Subscriber for "s1" processed event "' . MockEvent::class . '" (position: 1)',
+            'SubscriberHandledEvent: Subscriber for "s1" processed event "' . MockEvent::class . '" (position: 2)',
+            'CatchUpFinished: Finished catch-up of 1 subscription, processed 2 events (no errors), more events pending',
+        );
+    }
+
+    public function test_boot_with_limit_keeps_subscriptions_booting_until_no_events_are_pending(): void
+    {
+        $subscriber = Subscriber::create(SubscriptionId::fromString('s1'), fn() => null);
+        $this->subscriptionStore->_setSubscriptions(
+            Subscription::create(id: 's1', runMode: RunMode::FROM_BEGINNING, status: SubscriptionStatus::BOOTING),
+        );
+        $this->eventStore->append('event at #1');
+        $this->eventStore->append('event at #2');
+        $this->eventStore->append('event at #3');
+        $subscriptionEngine = $this->subscriptionEngine($subscriber);
+
+        $firstResult = $subscriptionEngine->boot(limit: 2);
+
+        self::assertTrue($firstResult->hasPendingEvents);
+        $this->assertSubscriptions(
+            ['id' => 's1', 'status' => 'BOOTING', 'position' => 2, 'error' => null],
+        );
+        $this->assertEmittedEngineEvents(
+            'CatchUpInitiated: Initiated catch-up of subscriptions in states BOOTING',
+            'CatchUpStarted: Starting catch-up of 1 subscription from position 1',
+            'SubscriberHandledEvent: Subscriber for "s1" processed event "' . MockEvent::class . '" (position: 1)',
+            'SubscriberHandledEvent: Subscriber for "s1" processed event "' . MockEvent::class . '" (position: 2)',
+            'CatchUpFinished: Finished catch-up of 1 subscription, processed 2 events (no errors), more events pending',
+        );
+
+        $secondResult = $subscriptionEngine->boot(limit: 2);
+
+        self::assertFalse($secondResult->hasPendingEvents);
+        self::assertSame(1, $secondResult->numberOfProcessedEvents);
+        $this->assertSubscriptions(
+            ['id' => 's1', 'status' => 'ACTIVE', 'position' => 3, 'error' => null],
+        );
+        $this->assertEmittedEngineEvents(
+            'CatchUpInitiated: Initiated catch-up of subscriptions in states BOOTING',
+            'CatchUpStarted: Starting catch-up of 1 subscription from position 3',
+            'SubscriberHandledEvent: Subscriber for "s1" processed event "' . MockEvent::class . '" (position: 3)',
+            'SubscriptionActivated: Subscription "s1" has been set to ACTIVE from status BOOTING',
+            'CatchUpFinished: Finished catch-up of 1 subscription, processed 1 event (no errors)',
+        );
+    }
+
+    public function test_catchUpActive_with_limit_reports_no_pending_events_if_all_subscriptions_failed(): void
+    {
+        $subscriber = Subscriber::create(SubscriptionId::fromString('s1'), function () {
+            throw new \RuntimeException('Exception from s1');
+        });
+        $this->subscriptionStore->_setSubscriptions(
+            Subscription::create(id: 's1', runMode: RunMode::FROM_BEGINNING, status: SubscriptionStatus::ACTIVE),
+        );
+        $this->eventStore->append('event at #1');
+        $this->eventStore->append('event at #2');
+        $this->eventStore->append('event at #3');
+
+        $result = $this->subscriptionEngine($subscriber)->catchUpActive(limit: 2);
+
+        self::assertFalse($result->successful());
+        self::assertFalse($result->hasPendingEvents);
+    }
+
+    /**
+     * @return iterable<string, array{string, int}>
+     */
+    public static function invalidLimitDataProvider(): iterable
+    {
+        yield 'catchUpActive with zero' => ['catchUpActive', 0];
+        yield 'catchUpActive with negative value' => ['catchUpActive', -1];
+        yield 'boot with zero' => ['boot', 0];
+        yield 'boot with negative value' => ['boot', -1];
+    }
+
+    #[DataProvider('invalidLimitDataProvider')]
+    public function test_catch_up_methods_throw_for_a_limit_below_one(string $method, int $limit): void
+    {
+        $subscriptionEngine = $this->subscriptionEngine();
+
+        try {
+            $subscriptionEngine->{$method}(limit: $limit);
+            self::fail('Expected exception');
+        } catch (\InvalidArgumentException $e) {
+            self::assertStringContainsString((string)$limit, $e->getMessage());
+        }
+        self::assertFalse($this->subscriptionStore->_isTransactionActive());
+        $this->assertEmittedEngineEvents();
+    }
+
+    public function test_boot_with_limit_activates_subscriptions_in_one_run_if_backlog_equals_limit(): void
+    {
+        $subscriber = Subscriber::create(SubscriptionId::fromString('s1'), fn() => null);
+        $this->subscriptionStore->_setSubscriptions(
+            Subscription::create(id: 's1', runMode: RunMode::FROM_BEGINNING, status: SubscriptionStatus::BOOTING),
+        );
+        $this->eventStore->append('event at #1');
+        $this->eventStore->append('event at #2');
+
+        $result = $this->subscriptionEngine($subscriber)->boot(limit: 2);
+
+        self::assertSame(2, $result->numberOfProcessedEvents);
+        self::assertFalse($result->hasPendingEvents);
+        $this->assertSubscriptions(
+            ['id' => 's1', 'status' => 'ACTIVE', 'position' => 2, 'error' => null],
+        );
+    }
+
+    public function test_catchUpActive_with_limit_counts_skipped_events(): void
+    {
+        $subscriber1 = Subscriber::create(SubscriptionId::fromString('s1'), fn() => null);
+        $subscriber2Invocations = 0;
+        $subscriber2 = Subscriber::create(SubscriptionId::fromString('s2'), function () use (&$subscriber2Invocations) {
+            $subscriber2Invocations++;
+        });
+        $this->subscriptionStore->_setSubscriptions(
+            Subscription::create(id: 's1', runMode: RunMode::FROM_BEGINNING, status: SubscriptionStatus::ACTIVE),
+            Subscription::create(id: 's2', runMode: RunMode::FROM_BEGINNING, status: SubscriptionStatus::ACTIVE)->with(position: Position::fromInteger(3)),
+        );
+        $this->eventStore->append('event at #1');
+        $this->eventStore->append('event at #2');
+        $this->eventStore->append('event at #3');
+        $this->eventStore->append('event at #4');
+
+        $result = $this->subscriptionEngine($subscriber1, $subscriber2)->catchUpActive(limit: 2);
+
+        self::assertSame(2, $result->numberOfProcessedEvents);
+        self::assertTrue($result->hasPendingEvents);
+        self::assertSame(0, $subscriber2Invocations);
+        $this->assertSubscriptions(
+            ['id' => 's1', 'status' => 'ACTIVE', 'position' => 2, 'error' => null],
+            ['id' => 's2', 'status' => 'ACTIVE', 'position' => 3, 'error' => null],
+        );
+    }
+
+    public function test_catchUpActive_with_limit_reports_pending_events_if_a_subscription_remains_after_failure(): void
+    {
+        $subscriber1 = Subscriber::create(SubscriptionId::fromString('s1'), function () {
+            throw new \RuntimeException('Exception from s1');
+        });
+        $subscriber2 = Subscriber::create(SubscriptionId::fromString('s2'), fn() => null);
+        $this->subscriptionStore->_setSubscriptions(
+            Subscription::create(id: 's1', runMode: RunMode::FROM_BEGINNING, status: SubscriptionStatus::ACTIVE),
+            Subscription::create(id: 's2', runMode: RunMode::FROM_BEGINNING, status: SubscriptionStatus::ACTIVE),
+        );
+        $this->eventStore->append('event at #1');
+        $this->eventStore->append('event at #2');
+        $this->eventStore->append('event at #3');
+
+        $result = $this->subscriptionEngine($subscriber1, $subscriber2)->catchUpActive(limit: 2);
+
+        self::assertFalse($result->successful());
+        self::assertTrue($result->hasPendingEvents);
+        $subscriptions = $this->subscriptionStore->findByCriteria(SubscriptionCriteria::noConstraints());
+        self::assertSame('ERROR', $subscriptions->get(SubscriptionId::fromString('s1'))->status->value);
+        self::assertSame(0, $subscriptions->get(SubscriptionId::fromString('s1'))->position->value);
+        self::assertSame('ACTIVE', $subscriptions->get(SubscriptionId::fromString('s2'))->status->value);
+        self::assertSame(2, $subscriptions->get(SubscriptionId::fromString('s2'))->position->value);
+    }
+
+    public function test_catchUpActive_with_limit_drains_the_event_log_when_called_in_a_loop(): void
+    {
+        $handledEvents = [];
+        $subscriber = Subscriber::create(SubscriptionId::fromString('s1'), function (MockEvent $event) use (&$handledEvents) {
+            $handledEvents[] = $event->position->value;
+        });
+        $this->subscriptionStore->_setSubscriptions(
+            Subscription::create(id: 's1', runMode: RunMode::FROM_BEGINNING, status: SubscriptionStatus::ACTIVE),
+        );
+        for ($i = 1; $i <= 5; $i++) {
+            $this->eventStore->append('event at #' . $i);
+        }
+        $subscriptionEngine = $this->subscriptionEngine($subscriber);
+
+        $numberOfRuns = 0;
+        do {
+            $result = $subscriptionEngine->catchUpActive(limit: 2);
+            $numberOfRuns++;
+        } while ($result->hasPendingEvents);
+
+        self::assertSame(3, $numberOfRuns);
+        self::assertSame([1, 2, 3, 4, 5], $handledEvents);
+    }
+
+    public function test_catchUpActive_with_limit_requests_one_more_event_than_it_processes(): void
+    {
+        $this->subscriptionStore->_setSubscriptions(
+            Subscription::create(id: 's1', runMode: RunMode::FROM_BEGINNING, status: SubscriptionStatus::ACTIVE),
+        );
+        $this->eventStore->append('event at #1');
+
+        $this->subscriptionEngine(Subscriber::create(SubscriptionId::fromString('s1'), fn() => null))->catchUpActive(limit: 2);
+
+        self::assertSame(3, $this->eventStore->_lastReadLimit());
+    }
+
+    public function test_catchUpActive_without_limit_reads_to_the_end_of_the_event_log(): void
+    {
+        $this->subscriptionStore->_setSubscriptions(
+            Subscription::create(id: 's1', runMode: RunMode::FROM_BEGINNING, status: SubscriptionStatus::ACTIVE),
+        );
+        $this->eventStore->append('event at #1');
+        $this->eventStore->append('event at #2');
+
+        $result = $this->subscriptionEngine(Subscriber::create(SubscriptionId::fromString('s1'), fn() => null))->catchUpActive();
+
+        self::assertNull($this->eventStore->_lastReadLimit());
+        self::assertSame(2, $result->numberOfProcessedEvents);
+        self::assertFalse($result->hasPendingEvents);
+    }
+
+    public function test_catchUpActive_with_limit_stops_at_limit_if_the_adapter_returns_more_events(): void
+    {
+        $this->eventStore = new InMemoryEventStoreAdapter(ignoreLimit: true);
+        $this->eventStore->append('event at #1');
+        $this->eventStore->append('event at #2');
+        $this->eventStore->append('event at #3');
+        $this->eventStore->append('event at #4');
+        $this->subscriptionStore->_setSubscriptions(
+            Subscription::create(id: 's1', runMode: RunMode::FROM_BEGINNING, status: SubscriptionStatus::ACTIVE),
+        );
+
+        $result = $this->subscriptionEngine(Subscriber::create(SubscriptionId::fromString('s1'), fn() => null))->catchUpActive(limit: 2);
+
+        self::assertSame(2, $result->numberOfProcessedEvents);
+        self::assertTrue($result->hasPendingEvents);
+        $this->assertSubscriptions(
+            ['id' => 's1', 'status' => 'ACTIVE', 'position' => 2, 'error' => null],
+        );
+    }
+
     private function subscriptionEngine(Subscriber ...$subscribers): SubscriptionEngine
     {
         $engine = new SubscriptionEngine(
