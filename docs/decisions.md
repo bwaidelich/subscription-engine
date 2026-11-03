@@ -1,0 +1,50 @@
+# Decisions
+
+## Bounded catch-ups (target: 2.0)
+
+### Context
+
+`SubscriptionEngine::catchUpSubscriptions()` holds one transaction and the row locks of all matching subscriptions while it reads to the end of the event log.
+With a large backlog that means one huge transaction and a long-held lock, which blocks fair rotation between workers.
+
+### Decisions
+
+| # | Topic | Decision | Why |
+|---|-------|----------|-----|
+| 1 | API shape | Optional `int\|null $limit = null` as second parameter of `catchUpActive()` and `boot()`. Values below 1 throw `InvalidArgumentException` | A criteria option would also reach `setup()`, `reset()` and `getSubscriptions()`, where a limit is meaningless. A new method doubles the API for one integer |
+| 2 | Name | `limit`, not `batchSize` | One call processes one batch. `batchSize` suggests the engine continues with further batches |
+| 3 | Default | `null` keeps today's behavior: one transaction, read to the end of the log. A bounded call runs one batch and returns. There is no internal loop | Returning control to the caller is what allows rotation between workers |
+| 4 | What the limit counts | Events read, including events skipped by subscriptions that are already ahead | Matches `numberOfProcessedEvents` and bounds I/O. Progress is guaranteed: the lowest-position subscription handles every event it reads or drops out with an error. Handler calls would be ambiguous, and a skip-only batch would be unbounded |
+| 5 | Reporting pending events | `ProcessedResult::$hasPendingEvents` (`bool`), always `false` when unbounded | Explicit and additive |
+| 6 | Detecting pending events | Read `limit + 1` events and leave the extra one unprocessed | No extra query, and a backlog of exactly `limit` events finishes in one run |
+| 7 | Meaning of pending | "Calling again with the same arguments could process more". `false` if every subscription of the run failed, even if the log has more events | `while ($result->hasPendingEvents)` always terminates. Callers check `successful()` separately. The rest of a batch is still read after a total failure, so that behavior is unchanged |
+| 8 | Adapter contract | Breaking: `EventStoreAdapter::read(Position $startPosition, int\|null $limit = null): iterable`. Adapters return at most `$limit` events in order. No sub-interface and no fallback | Accepted for 2.0. The engine still stops at the limit, because the peek needs that check anyway |
+| 9 | BOOTING to ACTIVE | A partial boot persists positions and stays `BOOTING`. All subscriptions of a run activate only once no pending event remains. No `SubscriptionActivated` on partial runs | `catchUpActive()` ignores `BOOTING`, so partial boots stay isolated. An event appended between read and commit is picked up by the next `catchUpActive()`, as before |
+| 10 | Engine events | `CatchUpFinished` fires on every run and gains `bool $hasPendingEvents = false`. `__toString()` appends `, more events pending` only when `true`. No new event classes | Existing log output stays identical |
+| 11 | Scope of the break | `read()` is the only breaking change of this work | Everything else is additive |
+| 12 | Package constraints | dcb and neos adapters and the doctrine store allow `^1 \|\| ^2`, revisited when 2.0 is tagged. No adapter tag until `read()` is final | Implementations may add an optional parameter under 1.x. A released adapter would break if `read()` changes again before 2.0 |
+
+### Known consequences
+
+- **Lock time scales with subscriber count.** With 10 subscriptions, `limit: 500` can mean 5,000 handler calls.
+- **A laggard holds back the others.** A run reads from the lowest position of its subscriptions, so subscriptions that are ahead receive no new events until the laggard catches up. Run independently lagging subscriptions separately through `SubscriptionEngineCriteria`. The engine has no automatic handling. Concurrent subscriptions may change this.
+
+### Open points
+
+For the `read()` filter/query follow-up:
+
+- `limit` would count matching events only, so it no longer bounds how much the store scans.
+- Positions advance only to the last handled event. A filtered subscription could stay far behind the log and rescan the same gap on every run, and a partial run could make no visible progress.
+- `limit + 1` still works, but "pending" would mean more *matching* events.
+
+For concurrent subscriptions:
+
+- They may revisit the one-lock-per-run model and the advice on per-subscription runs.
+
+## `processingSubscriptions` is not restored after an escaped exception
+
+The early return for "only detached subscriptions" restores `processingSubscriptions`. A `try/finally` that also covers escaped exceptions was rejected.
+
+`SubscriptionStore` has no rollback, so an escaped exception leaves its transaction open. With DBAL, the `commit()` of any later run only decrements the nesting level and nothing is persisted. Today the following no-criteria run fails loudly with `RecursiveCatchUpException`. A `finally` would remove that signal and let a long-running worker lose work silently.
+
+Handling this properly needs a rollback on `SubscriptionStore`, which is out of scope here.
