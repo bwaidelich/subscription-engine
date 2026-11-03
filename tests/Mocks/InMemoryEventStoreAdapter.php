@@ -18,9 +18,17 @@ final class InMemoryEventStoreAdapter implements EventStoreAdapter
      */
     private array $events = [];
 
-    public function read(Position $startPosition): iterable
+    private int|null $lastReadLimit = null;
+
+    public function __construct(
+        private readonly bool $ignoreLimit = false,
+    ) {
+    }
+
+    public function read(Position $startPosition, int|null $limit = null): iterable
     {
-        yield from array_slice($this->events, $startPosition->value - 1);
+        $this->lastReadLimit = $limit;
+        yield from array_slice($this->events, $startPosition->value - 1, $this->ignoreLimit ? null : $limit);
     }
 
     public function lastPosition(): Position
@@ -37,5 +45,10 @@ final class InMemoryEventStoreAdapter implements EventStoreAdapter
     {
         $position = Position::fromInteger(count($this->events) + 1);
         $this->events[] = new MockEvent($position, $data);
+    }
+
+    public function _lastReadLimit(): int|null
+    {
+        return $this->lastReadLimit;
     }
 }
