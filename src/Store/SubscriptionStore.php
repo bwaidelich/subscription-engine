@@ -20,6 +20,18 @@ interface SubscriptionStore
     public function findByCriteriaForUpdate(SubscriptionCriteria $criteria): Subscriptions;
 
     /**
+     * Locks the next subscription that is matching the criteria and not locked by another process, without waiting for locks.
+     * This is the subscription with the lowest position at the time of the read, and the lowest id among those with the same position.
+     * The returned subscription must reflect the state at the time of the lock, because the event handling continues from its position.
+     * The lock is held until {@see self::commit()} or {@see self::rollback()}
+     *
+     * Implementations must not lock more than the returned subscription, so that other processes can claim the remaining ones
+     *
+     * @return Subscription|null The claimed subscription, or NULL if there is none that matches the criteria and is available
+     */
+    public function claimNext(SubscriptionCriteria $criteria): Subscription|null;
+
+    /**
      * @throws \Throwable if the database has ended the transaction, see {@see self::update()}
      */
     public function add(Subscription $subscription): void;

@@ -87,3 +87,55 @@ MySQL and MariaDB roll back the whole transaction of a deadlock victim. A deadlo
 - A handler that catches the database exception itself and continues writes outside of the transaction until the next write of the store. Those writes are repeated after the rollback
 - An SQL error that keeps occurring on PostgreSQL never leads to `ERROR` and blocks all subscriptions of the run. Nothing is lost, and per-subscription runs isolate it
 - Damage from earlier versions can't be detected. It requires a `reset()` and a replay of the affected subscriptions
+
+## Skip-locked catch-ups (target: 2.0)
+
+### Context
+
+Several workers should be able to call the engine on the same set of subscriptions without advisory locks or external partition assignment. Each one catches up what it could lock and skips the rest.
+
+`findByCriteriaForUpdate()` blocks on locked rows, and a run locks all of its subscriptions. Simply adding `SKIP LOCKED` to that query would not help: The first worker would lock everything, and the others would find nothing until it commits.
+
+### Decisions
+
+| # | Topic | Decision | Why |
+|---|-------|----------|-----|
+| 1 | Claim size | One subscription per call, not configurable | Claiming all gives workers turns, but no parallelism. It also keeps the laggard problem. N > 1 brings that problem back for one more parameter |
+| 2 | Opt-in | Blocking stays the default | Synchronous callers rely on "once this returns, my events are processed" |
+| 3 | Engine API | New methods `catchUpNextActive($criteria, $limit)` and `bootNext($criteria, $limit)` | The behavior differs, not just a value. A flag would hide that the call handles only one subscription |
+| 4 | Store contract | Breaking: `SubscriptionStore::claimNext(SubscriptionCriteria $criteria): Subscription\|null` skips locked rows, returns the lowest position at the time of the read with ties broken by id, locks nothing else, and holds the lock until commit or rollback | A flag on `SubscriptionCriteria` would be meaningless for `findByCriteria()`. An optional interface would silently lose the feature. Both would let stores silently block |
+| 5 | Ordering | Lowest position first, ties by id | Lag first is the same order, as all subscriptions read the same log. With `ORDER BY id`, workers would keep claiming a caught-up subscription while another one lags |
+| 6 | Claim query in `DoctrineSubscriptionStore` | Two steps: Read the candidate ids without locks, ordered by position and id. Then try them one by one with `WHERE id = ? AND <criteria> FOR UPDATE SKIP LOCKED`. No schema change | `ORDER BY position, id LIMIT 1 FOR UPDATE SKIP LOCKED` locks all matching rows on MySQL and MariaDB, as they lock before sorting. An index on `(status, position)` prevents that, but makes blocking catch-ups deadlock on MySQL: The `SELECT` holds the index record and waits for the primary key, an `UPDATE` of `position` holds the primary key and waits for the index record. `READ COMMITTED` does not help. MariaDB also ignored that index if the criteria contained ids, which would have required `FORCE INDEX`. Verified on MySQL 8.4, MariaDB 11.4 and PostgreSQL 17 |
+| 7 | Everything locked | Success with 0 events, `ProcessedResult::$allSubscriptionsLocked` and the engine event `AllSubscriptionsLocked`. Detected with `findByCriteria()` after an empty claim | "All busy" and "nothing there" call for different reactions. The check can race with a released lock, which is harmless: The next call claims that row |
+| 8 | `hasPendingEvents` | Same contract as before: "Calling again with the same arguments could process more", across all matching subscriptions. An active subscription is pending if it is behind `lastPosition()`, a booting one if it exists at all | With only the claimed subscription in mind, `while ($result->hasPendingEvents)` would stop while others lag. A booting subscription at the end of the log still has to be activated |
+| 9 | Computing it | No queries if a claimed active subscription had no events: It was the lowest one, so all unlocked ones are at the end of the log. Otherwise `findByCriteria()` and `lastPosition()` | Idle polling stays cheap. As the order is read without locks, a lagging subscription can rarely be missed, see below. Locked subscriptions have stale positions and may report `true`, the next call then claims something else or reports them as locked |
+| 10 | Booting | A claimed subscription activates once its own read reached the end of the log | A lagging subscription must not keep the others in `BOOTING`. Consistent with decision 9 of bounded catch-ups, as a run now contains one subscription |
+| 11 | Detached subscriptions | Mark as `DETACHED` and claim again in the same transaction | A removed subscriber often has a low position. Returning right after detaching it would look like an idle run |
+| 12 | Failed runs | An exception between a successful claim and the commit rolls back and returns `ProcessedResult::failed(0, $errors)` with the engine event `CatchUpRunFailed`. The subscription keeps its status | With lowest-first, a subscription whose run keeps throwing would be claimed first forever. On PostgreSQL every repeating SQL error of a handler does that. If the exception escaped, a worker that gets restarted would run into it again immediately. Unlike `catchUpActive()`, which still rethrows |
+| 13 | Setting subscriptions aside | The engine instance leaves a failed subscription out of its next claims, by narrowing `ids` to the known subscribers minus the failed ones. Tracked per status | No store contract change. Per status, because a worker alternating between `bootNext()` and `catchUpNextActive()` would otherwise clear the list with every idle boot call |
+| 14 | Retrying them | The list is cleared for the criteria of a call, if the claim found nothing or a claimed active subscription had no events, or if nothing else is left to claim | The rest has no work, so the failed subscription gets one retry per cycle and a temporary error recovers by itself. `ERROR` is no option: It requires a `reset()` and a full replay |
+| 15 | Set-aside and `hasPendingEvents` | Set-aside subscriptions don't count as pending | Otherwise `while ($result->hasPendingEvents)` would never end |
+| 16 | Exceptions that still escape | From `beginTransaction()` and `claimNext()`, as no subscription is involved, and from listeners after the commit, as the batch is persisted | There is nothing to set aside, and an unavailable database must stay visible |
+| 17 | `setup()`, `reset()`, discovery | Keep blocking | Discovery would treat a locked row as missing, and `add()` would fail with a duplicate key. `setup()` and `reset()` would silently miss subscriptions |
+| 18 | Recursion guard | Unchanged, also for the new methods | A nested call on the same connection sees the lock of the outer run as free. The guard throws for `ids === null` and overlapping ids, so `claimNext()` can't return a subscription that is being processed |
+| 19 | Processed subscription on the result | Not part of `ProcessedResult` | `CatchUpStarted` and `CatchUpFinished` already carry it, and no caller logic needs it |
+| 20 | SQLite | Serial: `LIMIT 1` with the same ordering, without `FOR UPDATE` | `BEGIN EXCLUSIVE` already makes a second worker wait before it claims anything. Each event is still handled once, only the parallelism is lost |
+| 21 | MySQL < 8.0, MariaDB < 10.6 | DBAL's `NotSupported` escapes | The caller explicitly asked for non-blocking behavior. A silent fallback would turn a worker pool into a queue without any visible cause |
+| 22 | DBAL constraint | `^3.8 \|\| ^4` in `wwwision/subscription-engine-doctrine` | `forUpdate()` and `ConflictResolutionMode` exist from 3.8 on. The previous `^3.3` was already wrong, because `forUpdate()` doesn't exist below 3.8 |
+
+### Known consequences
+
+- **The claim order is not exact.** Another worker can commit between the two steps of a claim, so it may not be the lowest position anymore. Events of a subscription stay in order and are handled exactly once, as the locked read returns the current position and rechecks the criteria. In that race the shortcut of decision 9 can report no pending events while another subscription lags. A loop on `hasPendingEvents` can then stop early, and the next run picks it up.
+- **More queries.** A claim takes one query for the candidates, and one per candidate it tries.
+- **No order between subscribers.** Blocking runs call all subscribers per event. With claims, one subscription can be ahead of another, so a handler must not rely on the projection of another subscriber.
+- **More reads of the log.** N subscriptions take N reads of the event log, instead of one that they share.
+- **A short-lived process has no memory.** Set-aside subscriptions are tracked per engine instance. A process that makes a single call and exits runs into a failing subscription every time, and starves the others. Workers have to loop within the process.
+- **Failures can go unnoticed.** Callers must check `successful()`. `SubscriberFailedToHandleEvent` and `CatchUpRunFailed` make failures visible in the logs.
+- **Repeated work.** Every retry repeats the batch of the failing subscription, bounded by `limit`.
+- **Statement-based replication.** MySQL considers `SKIP LOCKED` unsafe for it.
+
+### Open points
+
+- `setup()` and `reset()` call `findByCriteriaForUpdate()` outside of a transaction, so the lock is released immediately and a worker can catch up while a `reset()` handler is running. This race already exists, but always-running workers make it more likely. A transaction is no simple fix, as DDL in handlers commits implicitly on MySQL. Until then: Stop workers before `reset()`.
+- A persisted failure counter that moves a subscription to `ERROR` after N failed runs would also cover short-lived processes. It requires a new column, a new field on `Subscription`, and a choice of N. It can be added later without conflicting with the set-aside.
+- The `read()` filter/query follow-up: With filtered subscriptions, a position can stay behind `lastPosition()` although no matching event is left, so `hasPendingEvents` would stay `true`.
