@@ -49,5 +49,10 @@
             "@test:cs",
             "@test:phpunit"
         ]
+    },
+    "extra": {
+        "branch-alias": {
+            "dev-main": "2.x-dev"
+        }
     }
 }

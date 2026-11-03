@@ -23,6 +23,7 @@ With a large backlog that means one huge transaction and a long-held lock, which
 | 10 | Engine events | `CatchUpFinished` fires on every run and gains `bool $hasPendingEvents = false`. `__toString()` appends `, more events pending` only when `true`. No new event classes | Existing log output stays identical |
 | 11 | Scope of the break | `read()` is the only breaking change of this work | Everything else is additive |
 | 12 | Package constraints | dcb and neos adapters and the doctrine store allow `^1 \|\| ^2`, revisited when 2.0 is tagged. No adapter tag until `read()` is final | Implementations may add an optional parameter under 1.x. A released adapter would break if `read()` changes again before 2.0 |
+| 13 | Local development against core | Core's `main` has the branch alias `2.x-dev`. Dependent packages set `minimum-stability: dev` and `prefer-stable: true` | composer-studio makes the local core canonical and hides Packagist. Without the alias, `dev-main` doesn't match `^1 \|\| ^2` and `composer update` fails. `prefer-stable` keeps other dependencies stable |
 
 ### Known consequences
 
