@@ -26,6 +26,7 @@ final class InMemorySubscriptionStore implements SubscriptionStore
     private bool $rollbackCalled = false;
     private bool $failOnRollback = false;
     private bool $failOnCommit = false;
+    private bool $failOnUpdate = false;
     private bool $hasPendingChanges = false;
     private bool $hasCommittedChanges = false;
 
@@ -66,6 +67,9 @@ final class InMemorySubscriptionStore implements SubscriptionStore
 
     public function update(Subscription $subscription): void
     {
+        if ($this->failOnUpdate) {
+            throw new \RuntimeException('Update failed');
+        }
         $this->hasPendingChanges = true;
         $this->subscriptionsById[$subscription->id->value] = $subscription;
     }
@@ -113,6 +117,11 @@ final class InMemorySubscriptionStore implements SubscriptionStore
     public function _failOnRollback(): void
     {
         $this->failOnRollback = true;
+    }
+
+    public function _failOnUpdate(): void
+    {
+        $this->failOnUpdate = true;
     }
 
     public function _failOnCommit(): void

@@ -65,7 +65,25 @@ With DBAL, the `commit()` of later runs only decremented the nesting level. Work
 - Subscriber handlers that share the connection also run with `READ COMMITTED` in these transactions
 - A transaction that was started outside of the store keeps its isolation level
 
-### Open points
+## A store fails if the database ended its transaction (target: 2.0)
 
-- A database error inside a subscriber is handled like any other subscriber failure: The subscription goes to `ERROR` and the run continues. If the database has rolled back the transaction because of that error (deadlock on MySQL), the rest of the run is not part of the transaction that the handlers assume
-- On PostgreSQL an SQL error aborts the transaction, so the following `update()` fails and escapes
+### Context
+
+The engine treats every exception of a subscriber as a failure of that subscriber: The subscription goes to `ERROR` and the run continues.
+MySQL and MariaDB roll back the whole transaction of a deadlock victim. A deadlock in a handler therefore discarded the events of the current batch, while all following writes were committed right away, including the positions. With two subscriptions and a deadlock at event 10, the failing one ended at position 9 with no rows, and the other one stayed `ACTIVE` with events 1 to 9 missing.
+
+### Decisions
+
+| # | Topic | Decision | Why |
+|---|-------|----------|-----|
+| 1 | Where to detect it | `SubscriptionStore::add()` and `update()` throw if the database has ended the transaction | The engine knows nothing about the database. The first write after the failure happens before any other subscriber handles another event, so nothing is written outside of the transaction. The contract needs no new method |
+| 2 | Outcome | The exception escapes, the run is rolled back and no subscription goes to `ERROR` | A deadlock is temporary, the next catch-up repeats the batch |
+| 3 | Detection in `DoctrineSubscriptionStore` | `SELECT 1` on MySQL and MariaDB, followed by `PDO::inTransaction()` | The response to the failed statement has no transaction status, so `inTransaction()` still reports `true` until the next successful statement |
+
+### Known consequences
+
+- One additional query per write of the store on MySQL and MariaDB
+- `DoctrineSubscriptionStore` can only detect this with PDO drivers, not with `mysqli`
+- A handler that catches the database exception itself and continues writes outside of the transaction until the next write of the store. Those writes are repeated after the rollback
+- An SQL error that keeps occurring on PostgreSQL never leads to `ERROR` and blocks all subscriptions of the run. Nothing is lost, and per-subscription runs isolate it
+- Damage from earlier versions can't be detected. It requires a `reset()` and a replay of the affected subscriptions
