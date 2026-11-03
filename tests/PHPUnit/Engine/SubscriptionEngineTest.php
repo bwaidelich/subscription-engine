@@ -717,6 +717,20 @@ final class SubscriptionEngineTest extends TestCase
         $this->assertEmittedEngineEvents();
     }
 
+    public function test_catchUpActive_can_run_again_after_all_matching_subscriptions_were_detached(): void
+    {
+        $this->subscriptionStore->_setSubscriptions(
+            Subscription::create(id: 's1', runMode: RunMode::FROM_BEGINNING, status: SubscriptionStatus::ACTIVE),
+        );
+        $subscriptionEngine = $this->subscriptionEngine();
+
+        $subscriptionEngine->catchUpActive();
+        $result = $subscriptionEngine->catchUpActive();
+
+        self::assertTrue($result->successful());
+        self::assertSame(0, $result->numberOfProcessedEvents);
+    }
+
     private function subscriptionEngine(Subscriber ...$subscribers): SubscriptionEngine
     {
         $engine = new SubscriptionEngine(

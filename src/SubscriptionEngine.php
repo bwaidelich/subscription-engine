@@ -296,6 +296,7 @@ final class SubscriptionEngine
         if ($subscriptionsToCatchup->isEmpty()) {
             $this->dispatchEngineEvent(new NoSubscriptionsFound($subscriptionCriteria));
             $this->subscriptionStore->commit();
+            $this->processingSubscriptions = $processingSubscriptionsBackup;
             return ProcessedResult::success(0);
         }
 
