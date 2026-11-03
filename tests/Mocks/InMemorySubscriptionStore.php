@@ -20,6 +20,11 @@ final class InMemorySubscriptionStore implements SubscriptionStore
     private bool $setupCalled = false;
 
     /**
+     * @var array<string> Subscriptions that are locked by another process
+     */
+    private array $lockedSubscriptionIds = [];
+
+    /**
      * @var array<array<string, Subscription>>
      */
     private array $transactionSnapshots = [];
@@ -27,6 +32,13 @@ final class InMemorySubscriptionStore implements SubscriptionStore
     private bool $failOnRollback = false;
     private bool $failOnCommit = false;
     private bool $failOnUpdate = false;
+    private bool $failOnClaim = false;
+    private bool $failOnBeginTransaction = false;
+
+    /**
+     * @var array<string>
+     */
+    private array $failOnUpdateOf = [];
     private bool $hasPendingChanges = false;
     private bool $hasCommittedChanges = false;
 
@@ -43,6 +55,16 @@ final class InMemorySubscriptionStore implements SubscriptionStore
     public function findByCriteriaForUpdate(SubscriptionCriteria $criteria): Subscriptions
     {
         return $this->filterByCriteria($criteria);
+    }
+
+    public function claimNext(SubscriptionCriteria $criteria): Subscription|null
+    {
+        if ($this->failOnClaim) {
+            throw new \RuntimeException('Claim failed');
+        }
+        $candidates = array_values(array_filter(iterator_to_array($this->filterByCriteria($criteria), false), fn(Subscription $subscription) => !in_array($subscription->id->value, $this->lockedSubscriptionIds, true)));
+        usort($candidates, static fn(Subscription $a, Subscription $b) => [$a->position->value, $a->id->value] <=> [$b->position->value, $b->id->value]);
+        return $candidates[0] ?? null;
     }
 
     private function filterByCriteria(SubscriptionCriteria $criteria): Subscriptions
@@ -70,12 +92,18 @@ final class InMemorySubscriptionStore implements SubscriptionStore
         if ($this->failOnUpdate) {
             throw new \RuntimeException('Update failed');
         }
+        if (in_array($subscription->id->value, $this->failOnUpdateOf, true)) {
+            throw new \RuntimeException(sprintf('Update of %s failed', $subscription->id->value));
+        }
         $this->hasPendingChanges = true;
         $this->subscriptionsById[$subscription->id->value] = $subscription;
     }
 
     public function beginTransaction(): void
     {
+        if ($this->failOnBeginTransaction) {
+            throw new \RuntimeException('Begin failed');
+        }
         $this->transactionSnapshots[] = $this->subscriptionsById;
     }
 
@@ -109,6 +137,11 @@ final class InMemorySubscriptionStore implements SubscriptionStore
         }
     }
 
+    public function _lock(string ...$subscriptionIds): void
+    {
+        $this->lockedSubscriptionIds = $subscriptionIds;
+    }
+
     public function _wasRollbackCalled(): bool
     {
         return $this->rollbackCalled;
@@ -122,6 +155,21 @@ final class InMemorySubscriptionStore implements SubscriptionStore
     public function _failOnUpdate(): void
     {
         $this->failOnUpdate = true;
+    }
+
+    public function _failOnUpdateOf(string ...$subscriptionIds): void
+    {
+        $this->failOnUpdateOf = $subscriptionIds;
+    }
+
+    public function _failOnClaim(): void
+    {
+        $this->failOnClaim = true;
+    }
+
+    public function _failOnBeginTransaction(): void
+    {
+        $this->failOnBeginTransaction = true;
     }
 
     public function _failOnCommit(): void

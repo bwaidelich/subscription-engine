@@ -52,4 +52,9 @@ final class SubscriptionIdsTest extends TestCase
         $union = $subscriptionIds1->merge($subscriptionIds2);
         self::assertSame($expectedResult, $union->toStringArray());
     }
+
+    public function test_without(): void
+    {
+        self::assertSame(['a', 'c'], SubscriptionIds::fromArray(['a', 'b', 'c'])->without(SubscriptionIds::fromArray(['b', 'd']))->toStringArray());
+    }
 }

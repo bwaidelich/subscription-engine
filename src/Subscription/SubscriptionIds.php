@@ -77,6 +77,11 @@ final readonly class SubscriptionIds implements IteratorAggregate, Countable, Js
         return new self(array_replace($this->subscriptionIdsById, $other->subscriptionIdsById));
     }
 
+    public function without(self $other): self
+    {
+        return new self(array_diff_key($this->subscriptionIdsById, $other->subscriptionIdsById));
+    }
+
     /**
      * @return list<string>
      */

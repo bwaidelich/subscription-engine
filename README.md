@@ -48,6 +48,44 @@ The lock is released between two calls, so other workers can take their turn.
 
 See [docs/decisions.md](./docs/decisions.md) for the reasoning.
 
+## Concurrent workers
+
+`SubscriptionEngine::catchUpNextActive()` and `SubscriptionEngine::bootNext()` allow several workers to process the same set of subscriptions in parallel, without advisory locks or partition assignment.
+Each call claims one subscription, the one with the lowest position that is not locked by another worker, and catches it up in its own transaction:
+
+```php
+while (true) {
+    $result = $subscriptionEngine->catchUpNextActive($criteria, limit: 500);
+    if (!$result->successful()) {
+        // handle $result->errors
+    }
+    if (!$result->hasPendingEvents) {
+        // nothing to do, or everything is locked by other workers ($result->allSubscriptionsLocked)
+        usleep(100_000);
+    }
+}
+```
+
+- `catchUpActive()` and `boot()` keep waiting for locks and remain the choice if the caller relies on its events being processed once the call returns. Both kinds of workers can be mixed
+- `hasPendingEvents` means that calling the method again with the same arguments could process more events, for any matching subscription. Keep polling instead of exiting: In rare cases it is `false` while a subscription lags, and a worker holding a lock could get killed
+- A booting subscription is activated as soon as it has reached the end of the event log, independent of the others
+- Events of one subscription are always handled in order. There is no order *between* subscribers though: One can be ahead of another, so a handler must not rely on the projection of a different subscriber
+- N subscriptions take N reads of the event log, instead of one that they share
+
+### Failing runs
+
+If a run fails after the claim, for example because of a deadlock or a repeating SQL error on PostgreSQL, it is rolled back and the method returns a failed result instead of throwing, unlike `catchUpActive()` and `boot()`. The subscription keeps its status.
+The engine instance leaves it out of its next claims, so it can't starve the others, and retries it as soon as they have nothing left to do. A temporary error recovers by itself.
+
+> [!WARNING]
+> This state is kept per engine instance. A process that makes a single call and exits runs into a failing subscription every time and starves the others, so workers have to loop within the process. Always check `successful()`, a repeating failure is otherwise only visible through the `SubscriberFailedToHandleEvent` and `CatchUpRunFailed` engine events.
+
+### Stop workers before `reset()`
+
+`setup()` and `reset()` don't skip locked subscriptions, but they don't hold locks either. A worker can catch up a subscription while its `reset()` handler is running.
+
+See [docs/decisions.md](./docs/decisions.md) for the reasoning.
+
 ## Exceptions during a catch-up
 
 An exception that escapes a catch-up, for example a deadlock, rolls back the current run and is rethrown.
@@ -84,6 +122,14 @@ public function rollback(): void;
 It discards all changes since the last `beginTransaction()`. Afterwards the store must be usable for a new transaction.
 
 `SubscriptionStore::add()` and `update()` must throw an exception if the database has ended the transaction on its own, for example after a deadlock. Note that `PDO::inTransaction()` still reports `true` on MySQL and MariaDB until the next successful statement.
+
+`SubscriptionStore` also has a new method for [concurrent workers](#concurrent-workers):
+
+```php
+public function claimNext(SubscriptionCriteria $criteria): Subscription|null;
+```
+
+It locks and returns the matching subscription with the lowest position that is not locked by another process, with ties broken by id, without waiting for locks. It must not lock any other subscription, and has to return the state at the time of the lock.
 
 > [!WARNING]
 > Up to 1.x a deadlock inside a subscriber handler on MySQL or MariaDB could persist positions without the events they stand for, for all subscriptions of that run. This can't be detected afterwards. If such deadlocks occurred, `reset()` and replay the affected subscriptions.
