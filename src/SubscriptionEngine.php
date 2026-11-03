@@ -283,87 +283,107 @@ final class SubscriptionEngine
         $errors = [];
 
         $this->subscriptionStore->beginTransaction();
-
-        $subscriptionsToCatchup = $this->subscriptionStore->findByCriteriaForUpdate($subscriptionCriteria);
         $processingSubscriptionsBackup = $this->processingSubscriptions;
-        $this->processingSubscriptions = $this->processingSubscriptions->merge($subscriptionsToCatchup->getIds());
-        foreach ($subscriptionsToCatchup as $subscription) {
-            if (!$this->subscribers->contain($subscription->id)) {
-                // mark detached subscriptions as we cannot handle them and exclude them from catchup
-                $this->subscriptionStore->update($subscription->with(status: SubscriptionStatus::DETACHED));
-                $this->dispatchEngineEvent(new SubscriptionDetached($subscription));
-                $subscriptionsToCatchup = $subscriptionsToCatchup->without($subscription->id);
-            }
-        }
-        $initialSubscriptionsToCatchup = $subscriptionsToCatchup;
-
-        if ($subscriptionsToCatchup->isEmpty()) {
-            $this->dispatchEngineEvent(new NoSubscriptionsFound($subscriptionCriteria));
-            $this->subscriptionStore->commit();
-            $this->processingSubscriptions = $processingSubscriptionsBackup;
-            return ProcessedResult::success(0);
-        }
-
-        $startPosition = $subscriptionsToCatchup->lowestPosition()?->next() ?? Position::none();
-        $this->dispatchEngineEvent(new CatchUpStarted($subscriptionsToCatchup, $startPosition));
-
-        /** @var array<string,Position> $highestPositionForSubscriber */
-        $highestPositionForSubscriber = [];
-
-        $hasPendingEvents = false;
-        foreach ($this->eventStoreAdapter->read($startPosition, $limit !== null ? $limit + 1 : null) as $event) {
-            if ($numberOfProcessedEvents === $limit) {
-                $hasPendingEvents = true;
-                break;
-            }
-            $eventPosition = $this->eventStoreAdapter->eventPosition($event);
+        $committed = false;
+        try {
+            $subscriptionsToCatchup = $this->subscriptionStore->findByCriteriaForUpdate($subscriptionCriteria);
+            $this->processingSubscriptions = $this->processingSubscriptions->merge($subscriptionsToCatchup->getIds());
             foreach ($subscriptionsToCatchup as $subscription) {
-                $subscriber = $this->subscribers->get($subscription->id);
-                if (!$eventPosition->isAheadOf($subscription->position)) {
-                    $this->dispatchEngineEvent(new SubscriberSkippedEvent($subscription, $event, $eventPosition));
-                    continue;
-                }
-                try {
-                    ($subscriber->handler)($event);
-                } catch (Throwable $e) {
-                    // ERROR Case:
-                    $errors[] = Error::create($subscription->id, $e->getMessage(), $errors === [] ? $e : null, $eventPosition);
-                    $this->dispatchEngineEvent(new SubscriberFailedToHandleEvent($subscription, $event, $eventPosition, $e));
-
-                    // for the leftover events we are not including this failed subscription for catchup
+                if (!$this->subscribers->contain($subscription->id)) {
+                    // mark detached subscriptions as we cannot handle them and exclude them from catchup
+                    $this->subscriptionStore->update($subscription->with(status: SubscriptionStatus::DETACHED));
+                    $this->dispatchEngineEvent(new SubscriptionDetached($subscription));
                     $subscriptionsToCatchup = $subscriptionsToCatchup->without($subscription->id);
-                    // update the subscription error state on either its unchanged or new position (if some events worked)
-                    // note that the possibly partially applied event will not be rolled back.
-                    $this->subscriptionStore->update($subscription->withError(SubscriptionError::fromPreviousStatusAndException($subscription->status, $e))->with(position: $highestPositionForSubscriber[$subscription->id->value] ?? $subscription->position));
+                }
+            }
+            $initialSubscriptionsToCatchup = $subscriptionsToCatchup;
+
+            if ($subscriptionsToCatchup->isEmpty()) {
+                $this->dispatchEngineEvent(new NoSubscriptionsFound($subscriptionCriteria));
+                $this->subscriptionStore->commit();
+                $committed = true;
+                return ProcessedResult::success(0);
+            }
+
+            $startPosition = $subscriptionsToCatchup->lowestPosition()?->next() ?? Position::none();
+            $this->dispatchEngineEvent(new CatchUpStarted($subscriptionsToCatchup, $startPosition));
+
+            /** @var array<string,Position> $highestPositionForSubscriber */
+            $highestPositionForSubscriber = [];
+
+            $hasPendingEvents = false;
+            foreach ($this->eventStoreAdapter->read($startPosition, $limit !== null ? $limit + 1 : null) as $event) {
+                if ($numberOfProcessedEvents === $limit) {
+                    $hasPendingEvents = true;
+                    break;
+                }
+                $eventPosition = $this->eventStoreAdapter->eventPosition($event);
+                foreach ($subscriptionsToCatchup as $subscription) {
+                    $subscriber = $this->subscribers->get($subscription->id);
+                    if (!$eventPosition->isAheadOf($subscription->position)) {
+                        $this->dispatchEngineEvent(new SubscriberSkippedEvent($subscription, $event, $eventPosition));
+                        continue;
+                    }
+                    try {
+                        ($subscriber->handler)($event);
+                    } catch (Throwable $e) {
+                        // ERROR Case:
+                        $errors[] = Error::create($subscription->id, $e->getMessage(), $errors === [] ? $e : null, $eventPosition);
+                        $this->dispatchEngineEvent(new SubscriberFailedToHandleEvent($subscription, $event, $eventPosition, $e));
+
+                        // for the leftover events we are not including this failed subscription for catchup
+                        $subscriptionsToCatchup = $subscriptionsToCatchup->without($subscription->id);
+                        // update the subscription error state on either its unchanged or new position (if some events worked)
+                        // note that the possibly partially applied event will not be rolled back.
+                        $this->subscriptionStore->update($subscription->withError(SubscriptionError::fromPreviousStatusAndException($subscription->status, $e))->with(position: $highestPositionForSubscriber[$subscription->id->value] ?? $subscription->position));
+                        continue;
+                    }
+                    // HAPPY Case:
+                    $this->dispatchEngineEvent(new SubscriberHandledEvent($subscription, $event, $eventPosition));
+                    $highestPositionForSubscriber[$subscription->id->value] = $eventPosition;
+                }
+                $numberOfProcessedEvents++;
+            }
+            // without any remaining subscription, calling the catch-up again could not process more events
+            $hasPendingEvents = $hasPendingEvents && !$subscriptionsToCatchup->isEmpty();
+            foreach ($subscriptionsToCatchup as $subscription) {
+                // The position will be set to the one the subscriber handled last, or if no events were in the stream, and we booted we keep the persisted position
+                $position = $highestPositionForSubscriber[$subscription->id->value] ?? $subscription->position;
+                if ($hasPendingEvents) {
+                    // a partial catch-up keeps the status: Booting subscriptions must not be triggered automatically until they reached the end of the event log
+                    $this->subscriptionStore->update($subscription->with(position: $position));
                     continue;
                 }
-                // HAPPY Case:
-                $this->dispatchEngineEvent(new SubscriberHandledEvent($subscription, $event, $eventPosition));
-                $highestPositionForSubscriber[$subscription->id->value] = $eventPosition;
+                // after catchup mark all subscriptions as active, so they are triggered automatically now.
+                $this->subscriptionStore->update($subscription->with(status: SubscriptionStatus::ACTIVE, position: $position));
+                if ($subscription->status !== SubscriptionStatus::ACTIVE) {
+                    $this->dispatchEngineEvent(new SubscriptionActivated($subscription, $subscription->status));
+                }
             }
-            $numberOfProcessedEvents++;
+            $this->subscriptionStore->commit();
+            $committed = true;
+            $errorsVo = $errors !== [] ? Errors::fromArray($errors) : null;
+            $this->dispatchEngineEvent(new CatchUpFinished($initialSubscriptionsToCatchup, $numberOfProcessedEvents, $errorsVo, $hasPendingEvents));
+            return $errorsVo === null ? ProcessedResult::success($numberOfProcessedEvents, $hasPendingEvents) : ProcessedResult::failed($numberOfProcessedEvents, $errorsVo, $hasPendingEvents);
+        } catch (Throwable $e) {
+            if (!$committed) {
+                $this->rollbackTransaction();
+            }
+            throw $e;
+        } finally {
+            $this->processingSubscriptions = $processingSubscriptionsBackup;
         }
-        // without any remaining subscription, calling the catch-up again could not process more events
-        $hasPendingEvents = $hasPendingEvents && !$subscriptionsToCatchup->isEmpty();
-        foreach ($subscriptionsToCatchup as $subscription) {
-            // The position will be set to the one the subscriber handled last, or if no events were in the stream, and we booted we keep the persisted position
-            $position = $highestPositionForSubscriber[$subscription->id->value] ?? $subscription->position;
-            if ($hasPendingEvents) {
-                // a partial catch-up keeps the status: Booting subscriptions must not be triggered automatically until they reached the end of the event log
-                $this->subscriptionStore->update($subscription->with(position: $position));
-                continue;
-            }
-            // after catchup mark all subscriptions as active, so they are triggered automatically now.
-            $this->subscriptionStore->update($subscription->with(status: SubscriptionStatus::ACTIVE, position: $position));
-            if ($subscription->status !== SubscriptionStatus::ACTIVE) {
-                $this->dispatchEngineEvent(new SubscriptionActivated($subscription, $subscription->status));
-            }
+    }
+
+    /**
+     * A failed rollback must not hide the exception that caused it, usually the connection is gone in that case and the transaction with it
+     */
+    private function rollbackTransaction(): void
+    {
+        try {
+            $this->subscriptionStore->rollback();
+        } catch (Throwable) {
         }
-        $this->subscriptionStore->commit();
-        $errorsVo = $errors !== [] ? Errors::fromArray($errors) : null;
-        $this->dispatchEngineEvent(new CatchUpFinished($initialSubscriptionsToCatchup, $numberOfProcessedEvents, $errorsVo, $hasPendingEvents));
-        $this->processingSubscriptions = $processingSubscriptionsBackup;
-        return $errorsVo === null ? ProcessedResult::success($numberOfProcessedEvents, $hasPendingEvents) : ProcessedResult::failed($numberOfProcessedEvents, $errorsVo, $hasPendingEvents);
     }
 
     /**

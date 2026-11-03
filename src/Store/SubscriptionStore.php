@@ -26,4 +26,10 @@ interface SubscriptionStore
     public function beginTransaction(): void;
 
     public function commit(): void;
+
+    /**
+     * Discard all changes since the last {@see self::beginTransaction()}
+     * The subscription engine calls this if an exception escapes a catch-up, afterwards the store must be usable for a new transaction
+     */
+    public function rollback(): void;
 }
