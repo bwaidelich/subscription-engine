@@ -42,10 +42,30 @@ For concurrent subscriptions:
 
 - They may revisit the one-lock-per-run model and the advice on per-subscription runs.
 
-## `processingSubscriptions` is not restored after an escaped exception
+## Escaping exceptions roll back the run (target: 2.0)
 
-The early return for "only detached subscriptions" restores `processingSubscriptions`. A `try/finally` that also covers escaped exceptions was rejected.
+### Context
 
-`SubscriptionStore` has no rollback, so an escaped exception leaves its transaction open. With DBAL, the `commit()` of any later run only decrements the nesting level and nothing is persisted. Today the following no-criteria run fails loudly with `RecursiveCatchUpException`. A `finally` would remove that signal and let a long-running worker lose work silently.
+`SubscriptionStore` had no rollback, so an exception that escaped a catch-up left its transaction open.
+On MySQL and MariaDB this is easy to reach: Workers booting concurrently deadlock.
+With DBAL, the `commit()` of later runs only decremented the nesting level. Workers that caught the exception and kept going reported processed events that were not persisted, and subscriptions ended in `ERROR`.
 
-Handling this properly needs a rollback on `SubscriptionStore`, which is out of scope here.
+### Decisions
+
+| # | Topic | Decision | Why |
+|---|-------|----------|-----|
+| 1 | Store contract | Breaking: `SubscriptionStore::rollback(): void` | Only the store can end its transaction |
+| 2 | Escaping exception before the commit | Roll back and rethrow the original exception. A failed rollback is ignored | Repeating the run is safe with the same engine instance. The original exception says what went wrong, a failed rollback usually only means that the connection is gone |
+| 3 | Escaping exception after the commit | No rollback | The batch is persisted. This covers listeners of `CatchUpFinished` |
+| 4 | `processingSubscriptions` | Restored on every exit path with `finally` | This was rejected before, because it would have hidden the open transaction. With the rollback there is nothing left to hide |
+| 5 | Isolation level | `DoctrineSubscriptionStore` uses `READ COMMITTED` for its transactions on MySQL and MariaDB. It only applies to the next transaction, and not if the connection is already in one | With `REPEATABLE READ`, `SELECT ... FOR UPDATE` takes next-key locks on the `status` index. Moving a row within that index then deadlocks with waiting workers |
+
+### Known consequences
+
+- Subscriber handlers that share the connection also run with `READ COMMITTED` in these transactions
+- A transaction that was started outside of the store keeps its isolation level
+
+### Open points
+
+- A database error inside a subscriber is handled like any other subscriber failure: The subscription goes to `ERROR` and the run continues. If the database has rolled back the transaction because of that error (deadlock on MySQL), the rest of the run is not part of the transaction that the handlers assume
+- On PostgreSQL an SQL error aborts the transaction, so the following `update()` fails and escapes

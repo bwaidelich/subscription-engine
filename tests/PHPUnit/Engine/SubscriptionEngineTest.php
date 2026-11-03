@@ -7,8 +7,10 @@ namespace Wwwision\SubscriptionEngine\Tests\PHPUnit\Engine;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
+use Wwwision\SubscriptionEngine\Engine\EngineEvent\CatchUpFinished;
 use Wwwision\SubscriptionEngine\Engine\EngineEvent\EngineEvent;
 use Wwwision\SubscriptionEngine\Engine\EngineEvent\NoSubscriptionsFound;
+use Wwwision\SubscriptionEngine\Engine\EngineEvent\SubscriberHandledEvent;
 use Wwwision\SubscriptionEngine\Engine\Exception\RecursiveCatchUpException;
 use Wwwision\SubscriptionEngine\Engine\Exception\UnknownSubscriptionIdsException;
 use Wwwision\SubscriptionEngine\Engine\SubscriptionEngineCriteria;
@@ -986,6 +988,136 @@ final class SubscriptionEngineTest extends TestCase
         $this->assertSubscriptions(
             ['id' => 's1', 'status' => 'ACTIVE', 'position' => 2, 'error' => null],
         );
+    }
+
+    public function test_catchUp_rolls_back_and_rethrows_if_an_exception_escapes(): void
+    {
+        $this->subscriptionStore->_setSubscriptions(
+            Subscription::create(id: 's1', runMode: RunMode::FROM_BEGINNING, status: SubscriptionStatus::ACTIVE),
+            Subscription::create(id: 'detached', runMode: RunMode::FROM_BEGINNING, status: SubscriptionStatus::ACTIVE),
+        );
+        $this->eventStore->append('event at #1');
+        $subscriptionEngine = $this->subscriptionEngine(Subscriber::create(SubscriptionId::fromString('s1'), fn() => null));
+        $exception = new \RuntimeException('Escaping exception');
+        $subscriptionEngine->onEngineEvent(static function (EngineEvent $event) use ($exception) {
+            if ($event instanceof SubscriberHandledEvent) {
+                throw $exception;
+            }
+        });
+
+        try {
+            $subscriptionEngine->catchUpActive();
+            self::fail('Expected exception');
+        } catch (\RuntimeException $e) {
+            self::assertSame($exception, $e);
+        }
+
+        self::assertFalse($this->subscriptionStore->_isTransactionActive());
+        $this->assertSubscriptions(
+            ['id' => 's1', 'status' => 'ACTIVE', 'position' => 0, 'error' => null],
+            ['id' => 'detached', 'status' => 'ACTIVE', 'position' => 0, 'error' => null],
+        );
+    }
+
+    public function test_catchUp_can_run_again_after_an_exception_escaped(): void
+    {
+        $handledEvents = [];
+        $subscriber = Subscriber::create(SubscriptionId::fromString('s1'), function (MockEvent $event) use (&$handledEvents) {
+            $handledEvents[] = $event->position->value;
+        });
+        $this->subscriptionStore->_setSubscriptions(
+            Subscription::create(id: 's1', runMode: RunMode::FROM_BEGINNING, status: SubscriptionStatus::ACTIVE),
+        );
+        $this->eventStore->append('event at #1');
+        $subscriptionEngine = $this->subscriptionEngine($subscriber);
+        $fail = true;
+        $subscriptionEngine->onEngineEvent(static function (EngineEvent $event) use (&$fail) {
+            if ($fail && $event instanceof SubscriberHandledEvent) {
+                throw new \RuntimeException('Escaping exception');
+            }
+        });
+        try {
+            $subscriptionEngine->catchUpActive();
+            self::fail('Expected exception');
+        } catch (\RuntimeException $e) {
+            self::assertSame('Escaping exception', $e->getMessage());
+        }
+        $fail = false;
+
+        $result = $subscriptionEngine->catchUpActive();
+
+        self::assertTrue($result->successful());
+        self::assertSame([1, 1], $handledEvents);
+        $this->assertSubscriptions(
+            ['id' => 's1', 'status' => 'ACTIVE', 'position' => 1, 'error' => null],
+        );
+    }
+
+    public function test_catchUp_keeps_committed_changes_if_an_exception_escapes_after_the_commit(): void
+    {
+        $this->subscriptionStore->_setSubscriptions(
+            Subscription::create(id: 's1', runMode: RunMode::FROM_BEGINNING, status: SubscriptionStatus::ACTIVE),
+        );
+        $this->eventStore->append('event at #1');
+        $subscriptionEngine = $this->subscriptionEngine(Subscriber::create(SubscriptionId::fromString('s1'), fn() => null));
+        $fail = true;
+        $subscriptionEngine->onEngineEvent(static function (EngineEvent $event) use (&$fail) {
+            if ($fail && $event instanceof CatchUpFinished) {
+                throw new \RuntimeException('Exception from listener');
+            }
+        });
+        try {
+            $subscriptionEngine->catchUpActive();
+            self::fail('Expected exception');
+        } catch (\RuntimeException $e) {
+            self::assertSame('Exception from listener', $e->getMessage());
+        }
+        $fail = false;
+
+        self::assertFalse($this->subscriptionStore->_wasRollbackCalled());
+        $this->assertSubscriptions(
+            ['id' => 's1', 'status' => 'ACTIVE', 'position' => 1, 'error' => null],
+        );
+        self::assertSame(0, $subscriptionEngine->catchUpActive()->numberOfProcessedEvents);
+    }
+
+    public function test_catchUp_rolls_back_if_the_commit_fails(): void
+    {
+        $this->subscriptionStore->_setSubscriptions(
+            Subscription::create(id: 's1', runMode: RunMode::FROM_BEGINNING, status: SubscriptionStatus::ACTIVE),
+        );
+        $this->eventStore->append('event at #1');
+        $this->subscriptionStore->_failOnCommit();
+
+        try {
+            $this->subscriptionEngine(Subscriber::create(SubscriptionId::fromString('s1'), fn() => null))->catchUpActive();
+            self::fail('Expected exception');
+        } catch (\RuntimeException $e) {
+            self::assertSame('Commit failed', $e->getMessage());
+        }
+
+        self::assertFalse($this->subscriptionStore->_isTransactionActive());
+        $this->assertSubscriptions(
+            ['id' => 's1', 'status' => 'ACTIVE', 'position' => 0, 'error' => null],
+        );
+    }
+
+    public function test_catchUp_rethrows_the_original_exception_if_the_rollback_fails(): void
+    {
+        $this->subscriptionStore->_setSubscriptions(
+            Subscription::create(id: 's1', runMode: RunMode::FROM_BEGINNING, status: SubscriptionStatus::ACTIVE),
+        );
+        $this->eventStore->append('event at #1');
+        $this->subscriptionStore->_failOnRollback();
+        $subscriptionEngine = $this->subscriptionEngine(Subscriber::create(SubscriptionId::fromString('s1'), fn() => null));
+        $subscriptionEngine->onEngineEvent(static function (EngineEvent $event) {
+            if ($event instanceof SubscriberHandledEvent) {
+                throw new \RuntimeException('Escaping exception');
+            }
+        });
+
+        $this->expectExceptionMessage('Escaping exception');
+        $subscriptionEngine->catchUpActive();
     }
 
     private function subscriptionEngine(Subscriber ...$subscribers): SubscriptionEngine

@@ -48,16 +48,39 @@ The lock is released between two calls, so other workers can take their turn.
 
 See [docs/decisions.md](./docs/decisions.md) for the reasoning.
 
+## Exceptions during a catch-up
+
+An exception that escapes a catch-up, for example a deadlock, rolls back the current run and is rethrown.
+Positions and everything else that is part of the transaction stay at the last committed batch, so the catch-up can be repeated with the same engine instance.
+
+> [!NOTE]
+> A database error inside a subscriber is not an escaping exception: The subscription goes to `ERROR` and the run continues without it.
+
+### Stores on MySQL and MariaDB
+
+With the default isolation level (`REPEATABLE READ`), workers that wait for a subscription lock can deadlock with a worker that changes the status of a subscription.
+`SubscriptionStore` implementations should use `READ COMMITTED` for their transactions on these databases, as [wwwision/subscription-engine-doctrine](https://packagist.org/packages/wwwision/subscription-engine-doctrine) does.
+
 ## Upgrading to 2.0
 
-`EventStoreAdapter::read()` has a new parameter that implementations have to add, otherwise PHP fails with a fatal error:
+Implementations of the following interfaces have to be adjusted, otherwise PHP fails with a fatal error.
+Implementations with these changes are also compatible with 1.x.
+
+`EventStoreAdapter::read()` has a new parameter:
 
 ```php
 public function read(Position $startPosition, int|null $limit = null): iterable;
 ```
 
 Implementations must return at most `$limit` events, and all events if it is `null`.
-An implementation with the additional parameter is also compatible with 1.x.
+
+`SubscriptionStore` has a new method:
+
+```php
+public function rollback(): void;
+```
+
+It discards all changes since the last `beginTransaction()`. Afterwards the store must be usable for a new transaction.
 
 > [!NOTE]
 > The signature of this method might still change until 2.0 is released.

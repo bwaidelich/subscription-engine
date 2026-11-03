@@ -19,7 +19,13 @@ final class InMemorySubscriptionStore implements SubscriptionStore
 
     private bool $setupCalled = false;
 
-    private bool $transactionActive = false;
+    /**
+     * @var array<array<string, Subscription>>
+     */
+    private array $transactionSnapshots = [];
+    private bool $rollbackCalled = false;
+    private bool $failOnRollback = false;
+    private bool $failOnCommit = false;
     private bool $hasPendingChanges = false;
     private bool $hasCommittedChanges = false;
 
@@ -66,12 +72,25 @@ final class InMemorySubscriptionStore implements SubscriptionStore
 
     public function beginTransaction(): void
     {
-        $this->transactionActive = true;
+        $this->transactionSnapshots[] = $this->subscriptionsById;
+    }
+
+    public function rollback(): void
+    {
+        $this->rollbackCalled = true;
+        if ($this->failOnRollback) {
+            throw new \RuntimeException('Rollback failed');
+        }
+        $this->subscriptionsById = array_pop($this->transactionSnapshots);
+        $this->hasPendingChanges = false;
     }
 
     public function commit(): void
     {
-        $this->transactionActive = false;
+        if ($this->failOnCommit) {
+            throw new \RuntimeException('Commit failed');
+        }
+        array_pop($this->transactionSnapshots);
         if ($this->hasPendingChanges) {
             $this->hasCommittedChanges = true;
             $this->hasPendingChanges = false;
@@ -86,6 +105,21 @@ final class InMemorySubscriptionStore implements SubscriptionStore
         }
     }
 
+    public function _wasRollbackCalled(): bool
+    {
+        return $this->rollbackCalled;
+    }
+
+    public function _failOnRollback(): void
+    {
+        $this->failOnRollback = true;
+    }
+
+    public function _failOnCommit(): void
+    {
+        $this->failOnCommit = true;
+    }
+
     public function _wasSetupCalled(): bool
     {
         return $this->setupCalled;
@@ -93,7 +127,7 @@ final class InMemorySubscriptionStore implements SubscriptionStore
 
     public function _isTransactionActive(): bool
     {
-        return $this->transactionActive;
+        return $this->transactionSnapshots !== [];
     }
 
     public function _hasPendingChanges(): bool
