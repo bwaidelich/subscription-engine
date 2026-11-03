@@ -1120,6 +1120,35 @@ final class SubscriptionEngineTest extends TestCase
         $subscriptionEngine->catchUpActive();
     }
 
+    public function test_catchUp_stops_and_rolls_back_if_the_store_fails_to_record_a_failed_subscriber(): void
+    {
+        $this->subscriptionStore->_setSubscriptions(
+            Subscription::create(id: 's1', runMode: RunMode::FROM_BEGINNING, status: SubscriptionStatus::ACTIVE),
+            Subscription::create(id: 's2', runMode: RunMode::FROM_BEGINNING, status: SubscriptionStatus::ACTIVE),
+        );
+        $this->eventStore->append('event at #1');
+        $this->eventStore->append('event at #2');
+        $subscriber1 = Subscriber::create(SubscriptionId::fromString('s1'), function () {
+            throw new \RuntimeException('Deadlock');
+        });
+        $subscriber2Invocations = 0;
+        $subscriber2 = Subscriber::create(SubscriptionId::fromString('s2'), function () use (&$subscriber2Invocations) {
+            $subscriber2Invocations++;
+        });
+        $this->subscriptionStore->_failOnUpdate();
+
+        try {
+            $this->subscriptionEngine($subscriber1, $subscriber2)->catchUpActive();
+            self::fail('Expected exception');
+        } catch (\RuntimeException $e) {
+            self::assertSame('Update failed', $e->getMessage());
+        }
+
+        self::assertSame(0, $subscriber2Invocations);
+        self::assertTrue($this->subscriptionStore->_wasRollbackCalled());
+        self::assertFalse($this->subscriptionStore->_isTransactionActive());
+    }
+
     private function subscriptionEngine(Subscriber ...$subscribers): SubscriptionEngine
     {
         $engine = new SubscriptionEngine(

@@ -54,7 +54,8 @@ An exception that escapes a catch-up, for example a deadlock, rolls back the cur
 Positions and everything else that is part of the transaction stay at the last committed batch, so the catch-up can be repeated with the same engine instance.
 
 > [!NOTE]
-> A database error inside a subscriber is not an escaping exception: The subscription goes to `ERROR` and the run continues without it.
+> A database error inside a subscriber is usually not an escaping exception: The subscription goes to `ERROR` and the run continues without it.
+> If the error has ended the transaction, which MySQL and MariaDB do for a deadlock victim and PostgreSQL for every SQL error, the store fails on its next write. That exception escapes, so no subscription goes to `ERROR` and the batch is repeated on the next catch-up. An error that keeps occurring on PostgreSQL therefore blocks all subscriptions of the run. Run them separately via `SubscriptionEngineCriteria` to isolate it.
 
 ### Stores on MySQL and MariaDB
 
@@ -81,6 +82,11 @@ public function rollback(): void;
 ```
 
 It discards all changes since the last `beginTransaction()`. Afterwards the store must be usable for a new transaction.
+
+`SubscriptionStore::add()` and `update()` must throw an exception if the database has ended the transaction on its own, for example after a deadlock. Note that `PDO::inTransaction()` still reports `true` on MySQL and MariaDB until the next successful statement.
+
+> [!WARNING]
+> Up to 1.x a deadlock inside a subscriber handler on MySQL or MariaDB could persist positions without the events they stand for, for all subscriptions of that run. This can't be detected afterwards. If such deadlocks occurred, `reset()` and replay the affected subscriptions.
 
 > [!NOTE]
 > The signature of this method might still change until 2.0 is released.

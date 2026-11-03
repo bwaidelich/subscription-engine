@@ -19,8 +19,17 @@ interface SubscriptionStore
 
     public function findByCriteriaForUpdate(SubscriptionCriteria $criteria): Subscriptions;
 
+    /**
+     * @throws \Throwable if the database has ended the transaction, see {@see self::update()}
+     */
     public function add(Subscription $subscription): void;
 
+    /**
+     * Implementations must throw an exception if the database has ended the transaction on its own, for example because of a deadlock in a subscriber handler.
+     * Otherwise, the change would be persisted right away, and so could be a position without the events it stands for.
+     *
+     * @throws \Throwable if the database has ended the transaction
+     */
     public function update(Subscription $subscription): void;
 
     public function beginTransaction(): void;
