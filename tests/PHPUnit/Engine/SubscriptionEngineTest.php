@@ -476,7 +476,7 @@ final class SubscriptionEngineTest extends TestCase
         );
         $this->assertEmittedEngineEvents(
             'ResetStarted: Start to setup',
-            'NoSubscriptionsFound: No subscriptions found for criteria: {"ids":["s3"],"status":["NEW","BOOTING","ACTIVE","DETACHED","ERROR"]}'
+            'NoSubscriptionsFound: No subscriptions found for criteria: {"ids":["s3"],"status":["NEW","BOOTING","ACTIVE","DETACHED","ERROR","RESETTING"]}'
         );
         self::assertTrue($result->successful());
         self::assertFalse($this->subscriptionStore->_hasPendingChanges(), 'Subscription store has pending changes');
@@ -639,9 +639,9 @@ final class SubscriptionEngineTest extends TestCase
         );
         $result = $subscriptionEngine->reset();
 
-        $this->assertSubscriptions(
-            ['id' => 's1', 'status' => 'ACTIVE', 'position' => 123, 'error' => null],
-        );
+        self::assertSame(SubscriptionStatus::ERROR, $this->subscriptionStore->findByCriteria(SubscriptionCriteria::noConstraints())->get(SubscriptionId::fromString('s1'))->status);
+        self::assertSame(SubscriptionStatus::ACTIVE, $this->subscriptionStore->findByCriteria(SubscriptionCriteria::noConstraints())->get(SubscriptionId::fromString('s1'))->error?->previousStatus);
+        self::assertSame(123, $this->subscriptionStore->findByCriteria(SubscriptionCriteria::noConstraints())->get(SubscriptionId::fromString('s1'))->position->value);
         $this->assertEmittedEngineEvents(
             'ResetStarted: Start to setup',
             'FailedToResetSubscriber: Subscriber for "s1" has an error in the reset method: Exception from s1 reset function',
@@ -649,8 +649,338 @@ final class SubscriptionEngineTest extends TestCase
         self::assertSame('"s1": Exception from s1 reset function', $result->errors->getClampedMessage());
     }
 
-    // ---------------------
+    public function test_reset_keeps_workers_out_while_its_handler_is_running(): void
+    {
+        $this->eventStore->append(1);
+        $this->eventStore->append(1);
+        $this->eventStore->append(1);
+        $this->subscriptionStore->_setSubscriptions(self::subscriptionAt('s1', SubscriptionStatus::ACTIVE, 2));
+        $handled = [];
+        $handler = function (MockEvent $event) use (&$handled) {
+            $handled[] = $event->position->value;
+        };
+        $worker = $this->subscriptionEngine(Subscriber::create(id: 's1', handler: $handler));
+        $results = [];
+        $transactionActiveInHandler = null;
+        $engine = $this->subscriptionEngine(Subscriber::create(id: 's1', handler: $handler, reset: function () use ($worker, &$results, &$transactionActiveInHandler) {
+            $transactionActiveInHandler = $this->subscriptionStore->_isTransactionActive();
+            $results[] = $worker->catchUpActive();
+            $results[] = $worker->catchUpNextActive();
+            $results[] = $worker->boot();
+            $results[] = $worker->bootNext();
+        }));
 
+        $result = $engine->reset();
+
+        self::assertTrue($result->successful());
+        self::assertFalse($transactionActiveInHandler, 'handlers must be able to use DDL');
+        self::assertSame([], $handled);
+        self::assertSame([0, 0, 0, 0], array_map(static fn ($r) => $r->numberOfProcessedEvents, $results));
+        $this->assertSubscriptions(['id' => 's1', 'status' => 'BOOTING', 'position' => 0, 'error' => null]);
+    }
+
+    public function test_reset_fences_all_subscriptions_before_the_first_handler_runs(): void
+    {
+        $this->subscriptionStore->_setSubscriptions(self::subscriptionAt('s1', SubscriptionStatus::ACTIVE, 1), self::subscriptionAt('s2', SubscriptionStatus::BOOTING, 1), self::subscriptionAt('s3', SubscriptionStatus::ACTIVE, 1));
+        $statusInHandler = [];
+        $engine = $this->subscriptionEngine(
+            Subscriber::create(id: 's1', handler: fn () => null, reset: function () use (&$statusInHandler) {
+                $statusInHandler = array_map(static fn (Subscription $s) => $s->status->value, iterator_to_array($this->subscriptionStore->findByCriteria(SubscriptionCriteria::noConstraints()), false));
+            }),
+            Subscriber::create(id: 's2', handler: fn () => null),
+        );
+
+        $engine->reset();
+
+        self::assertSame(['RESETTING', 'RESETTING', 'ACTIVE'], $statusInHandler, 's3 has no subscriber and must not be fenced');
+        $this->assertSubscriptions(
+            ['id' => 's1', 'status' => 'BOOTING', 'position' => 0, 'error' => null],
+            ['id' => 's2', 'status' => 'BOOTING', 'position' => 0, 'error' => null],
+            ['id' => 's3', 'status' => 'ACTIVE', 'position' => 1, 'error' => null],
+        );
+    }
+
+    public function test_reset_changes_nothing_if_the_fence_fails(): void
+    {
+        $this->subscriptionStore->_setSubscriptions(self::subscriptionAt('s1', SubscriptionStatus::ACTIVE, 1), self::subscriptionAt('s2', SubscriptionStatus::ACTIVE, 2));
+        $this->subscriptionStore->_failOnUpdateOf('s2');
+        $handlerCalled = false;
+        $engine = $this->subscriptionEngine(
+            Subscriber::create(id: 's1', handler: fn () => null, reset: function () use (&$handlerCalled) {
+                $handlerCalled = true;
+            }),
+            Subscriber::create(id: 's2', handler: fn () => null),
+        );
+
+        try {
+            $engine->reset();
+            self::fail('Expected the exception to escape');
+        } catch (\RuntimeException $e) {
+            self::assertSame('Update of s2 failed', $e->getMessage());
+        }
+
+        self::assertFalse($handlerCalled);
+        self::assertFalse($this->subscriptionStore->_isTransactionActive());
+        $this->assertSubscriptions(
+            ['id' => 's1', 'status' => 'ACTIVE', 'position' => 1, 'error' => null],
+            ['id' => 's2', 'status' => 'ACTIVE', 'position' => 2, 'error' => null],
+        );
+    }
+
+    public function test_reset_continues_with_other_subscriptions_if_a_handler_fails(): void
+    {
+        $this->subscriptionStore->_setSubscriptions(self::subscriptionAt('s1', SubscriptionStatus::ACTIVE, 1), self::subscriptionAt('s2', SubscriptionStatus::ACTIVE, 2));
+        $engine = $this->subscriptionEngine(
+            Subscriber::create(id: 's1', handler: fn () => null, reset: fn () => throw new \RuntimeException('Exception from s1 reset function')),
+            Subscriber::create(id: 's2', handler: fn () => null),
+        );
+
+        $result = $engine->reset();
+
+        self::assertFalse($result->successful());
+        $subscriptions = $this->subscriptionStore->findByCriteria(SubscriptionCriteria::noConstraints());
+        self::assertSame(SubscriptionStatus::ERROR, $subscriptions->get(SubscriptionId::fromString('s1'))->status);
+        self::assertSame(SubscriptionStatus::BOOTING, $subscriptions->get(SubscriptionId::fromString('s2'))->status);
+
+        // a retry recovers from ERROR without force
+        $retried = $this->subscriptionEngine(Subscriber::create(id: 's1', handler: fn () => null), Subscriber::create(id: 's2', handler: fn () => null))->reset();
+        self::assertTrue($retried->successful());
+        self::assertSame(SubscriptionStatus::BOOTING, $this->subscriptionStore->findByCriteria(SubscriptionCriteria::noConstraints())->get(SubscriptionId::fromString('s1'))->status);
+    }
+
+    public function test_reset_refuses_a_subscription_that_is_already_resetting(): void
+    {
+        $this->subscriptionStore->_setSubscriptions(self::subscriptionAt('s1', SubscriptionStatus::RESETTING, 3), self::subscriptionAt('s2', SubscriptionStatus::ACTIVE, 2));
+        $handlerCalled = false;
+        $engine = $this->subscriptionEngine(
+            Subscriber::create(id: 's1', handler: fn () => null, reset: function () use (&$handlerCalled) {
+                $handlerCalled = true;
+            }),
+            Subscriber::create(id: 's2', handler: fn () => null, reset: fn () => null),
+        );
+
+        $result = $engine->reset();
+
+        self::assertFalse($handlerCalled);
+        self::assertFalse($result->successful());
+        self::assertStringContainsString('"s1"', $result->errors->getClampedMessage());
+        $this->assertSubscriptions(
+            ['id' => 's1', 'status' => 'RESETTING', 'position' => 3, 'error' => null],
+            ['id' => 's2', 'status' => 'BOOTING', 'position' => 0, 'error' => null],
+        );
+        $this->assertEmittedEngineEvents(
+            'ResetStarted: Start to setup',
+            'ResetAlreadyInProgress: Subscription "s1" is already being reset, or a previous reset has crashed. Skipping it, use the "force" flag to take over',
+            'SubscriberWasReset: Subscriber for "s2" has been reset, changing status from ACTIVE to BOOTING',
+        );
+    }
+
+    public function test_reset_with_force_takes_over_a_subscription_that_is_resetting(): void
+    {
+        $this->subscriptionStore->_setSubscriptions(self::subscriptionAt('s1', SubscriptionStatus::RESETTING, 3));
+        $handlerCalled = false;
+        $engine = $this->subscriptionEngine(Subscriber::create(id: 's1', handler: fn () => null, reset: function () use (&$handlerCalled) {
+            $handlerCalled = true;
+        }));
+
+        $result = $engine->reset(force: true);
+
+        self::assertTrue($handlerCalled);
+        self::assertTrue($result->successful());
+        $this->assertSubscriptions(['id' => 's1', 'status' => 'BOOTING', 'position' => 0, 'error' => null]);
+    }
+
+    public function test_reset_leaves_subscriptions_fenced_if_the_final_write_fails_and_force_recovers(): void
+    {
+        $this->subscriptionStore->_setSubscriptions(self::subscriptionAt('s1', SubscriptionStatus::ACTIVE, 1), self::subscriptionAt('s2', SubscriptionStatus::ACTIVE, 2));
+        $engine = $this->subscriptionEngine(
+            Subscriber::create(id: 's1', handler: fn () => null, reset: function () {
+                $this->subscriptionStore->_failOnUpdateOf('s1');
+            }),
+            Subscriber::create(id: 's2', handler: fn () => null),
+        );
+
+        try {
+            $engine->reset();
+            self::fail('Expected the exception to escape');
+        } catch (\RuntimeException $e) {
+            self::assertSame('Update of s1 failed', $e->getMessage());
+        }
+        $this->assertSubscriptions(
+            ['id' => 's1', 'status' => 'RESETTING', 'position' => 1, 'error' => null],
+            ['id' => 's2', 'status' => 'RESETTING', 'position' => 2, 'error' => null],
+        );
+
+        $this->subscriptionStore->_failOnUpdateOf();
+        self::assertTrue($this->subscriptionEngine(Subscriber::create(id: 's1', handler: fn () => null), Subscriber::create(id: 's2', handler: fn () => null))->reset(force: true)->successful());
+        $this->assertSubscriptions(
+            ['id' => 's1', 'status' => 'BOOTING', 'position' => 0, 'error' => null],
+            ['id' => 's2', 'status' => 'BOOTING', 'position' => 0, 'error' => null],
+        );
+    }
+
+    public function test_setup_does_not_regress_the_position_written_by_a_worker_during_its_handler(): void
+    {
+        $this->eventStore->append(1);
+        $this->eventStore->append(1);
+        $this->eventStore->append(1);
+        $this->subscriptionStore->_setSubscriptions(Subscription::create(id: 's1', runMode: RunMode::FROM_BEGINNING, status: SubscriptionStatus::BOOTING));
+        $worker = $this->subscriptionEngine(Subscriber::create(id: 's1', handler: fn () => null));
+        $transactionActiveInHandler = null;
+        $engine = $this->subscriptionEngine(Subscriber::create(id: 's1', handler: fn () => null, setup: function () use ($worker, &$transactionActiveInHandler) {
+            $transactionActiveInHandler = $this->subscriptionStore->_isTransactionActive();
+            $worker->boot(limit: 2);
+        }));
+
+        $result = $engine->setup();
+
+        self::assertTrue($result->successful());
+        self::assertFalse($transactionActiveInHandler);
+        $this->assertSubscriptions(['id' => 's1', 'status' => 'BOOTING', 'position' => 2, 'error' => null]);
+    }
+
+    public function test_setup_does_not_downgrade_a_subscription_that_a_worker_activated_during_its_handler(): void
+    {
+        $this->eventStore->append(1);
+        $this->subscriptionStore->_setSubscriptions(Subscription::create(id: 's1', runMode: RunMode::FROM_BEGINNING, status: SubscriptionStatus::BOOTING));
+        $worker = $this->subscriptionEngine(Subscriber::create(id: 's1', handler: fn () => null));
+        $engine = $this->subscriptionEngine(Subscriber::create(id: 's1', handler: fn () => null, setup: fn () => $worker->boot()));
+
+        $engine->setup();
+
+        $this->assertSubscriptions(['id' => 's1', 'status' => 'ACTIVE', 'position' => 1, 'error' => null]);
+    }
+
+    public function test_setup_does_not_overwrite_the_fence_of_a_concurrent_reset(): void
+    {
+        $this->subscriptionStore->_setSubscriptions(self::subscriptionAt('s1', SubscriptionStatus::BOOTING, 2));
+        $engine = $this->subscriptionEngine(Subscriber::create(id: 's1', handler: fn () => null, setup: function () {
+            $this->subscriptionStore->_setSubscriptions(self::subscriptionAt('s1', SubscriptionStatus::RESETTING, 2));
+        }));
+
+        self::assertTrue($engine->setup()->successful());
+
+        $this->assertSubscriptions(['id' => 's1', 'status' => 'RESETTING', 'position' => 2, 'error' => null]);
+    }
+
+    public function test_setup_ignores_resetting_subscriptions(): void
+    {
+        $this->subscriptionStore->_setSubscriptions(self::subscriptionAt('s1', SubscriptionStatus::RESETTING, 2));
+        $handlerCalled = false;
+        $engine = $this->subscriptionEngine(Subscriber::create(id: 's1', handler: fn () => null, setup: function () use (&$handlerCalled) {
+            $handlerCalled = true;
+        }));
+
+        $engine->setup();
+
+        self::assertFalse($handlerCalled);
+        $this->assertSubscriptions(['id' => 's1', 'status' => 'RESETTING', 'position' => 2, 'error' => null]);
+    }
+
+    public function test_setup_writes_a_failing_handler_on_the_fresh_subscription(): void
+    {
+        $this->subscriptionStore->_setSubscriptions(self::subscriptionAt('s1', SubscriptionStatus::BOOTING, 0));
+        $worker = $this->subscriptionEngine(Subscriber::create(id: 's1', handler: fn () => null));
+        $this->eventStore->append(1);
+        $this->eventStore->append(1);
+        $engine = $this->subscriptionEngine(Subscriber::create(id: 's1', handler: fn () => null, setup: function () use ($worker) {
+            $worker->boot(limit: 1);
+            throw new \RuntimeException('Exception from s1 setup function');
+        }));
+
+        self::assertFalse($engine->setup()->successful());
+
+        $subscription = $this->subscriptionStore->findByCriteria(SubscriptionCriteria::noConstraints())->get(SubscriptionId::fromString('s1'));
+        self::assertSame(SubscriptionStatus::ERROR, $subscription->status);
+        self::assertSame(1, $subscription->position->value);
+    }
+
+    public function test_setup_does_not_overwrite_a_fence_with_a_failing_handler(): void
+    {
+        $this->subscriptionStore->_setSubscriptions(self::subscriptionAt('s1', SubscriptionStatus::BOOTING, 2));
+        $engine = $this->subscriptionEngine(Subscriber::create(id: 's1', handler: fn () => null, setup: function () {
+            $this->subscriptionStore->_setSubscriptions(self::subscriptionAt('s1', SubscriptionStatus::RESETTING, 2));
+            throw new \RuntimeException('Exception from s1 setup function');
+        }));
+
+        self::assertFalse($engine->setup()->successful());
+
+        $this->assertSubscriptions(['id' => 's1', 'status' => 'RESETTING', 'position' => 2, 'error' => null]);
+    }
+
+    public function test_setup_rolls_back_and_rethrows_if_the_transition_fails(): void
+    {
+        $this->subscriptionStore->_setSubscriptions(Subscription::create(id: 's1', runMode: RunMode::FROM_BEGINNING, status: SubscriptionStatus::NEW));
+        $this->subscriptionStore->_failOnUpdateOf('s1');
+        $engine = $this->subscriptionEngine(Subscriber::create(id: 's1', handler: fn () => null));
+
+        try {
+            $engine->setup();
+            self::fail('Expected the exception to escape');
+        } catch (\RuntimeException $e) {
+            self::assertSame('Update of s1 failed', $e->getMessage());
+        }
+
+        self::assertFalse($this->subscriptionStore->_isTransactionActive());
+        self::assertTrue($this->subscriptionStore->_wasRollbackCalled());
+    }
+
+    /**
+     * @return iterable<array{string, array<string>|null}>
+     */
+    public static function recursiveSetupAndResetCalls(): iterable
+    {
+        yield 'setup without criteria' => ['setup', null];
+        yield 'setup with overlapping criteria' => ['setup', ['s1']];
+        yield 'reset without criteria' => ['reset', null];
+        yield 'reset with overlapping criteria' => ['reset', ['s1']];
+    }
+
+    /**
+     * @param array<string>|null $ids
+     */
+    #[DataProvider('recursiveSetupAndResetCalls')]
+    public function test_setup_and_reset_throw_if_called_recursively_for_the_subscription_being_processed(string $method, array|null $ids): void
+    {
+        $this->eventStore->append(1);
+        $this->subscriptionStore->_setSubscriptions(self::subscriptionAt('s1', SubscriptionStatus::ACTIVE, 0));
+        $engine = null;
+        $caught = null;
+        $engine = $this->subscriptionEngine(Subscriber::create(id: 's1', handler: function () use (&$engine, &$caught, $method, $ids) {
+            try {
+                $engine->{$method}($ids !== null ? SubscriptionEngineCriteria::create($ids) : null);
+            } catch (RecursiveCatchUpException $e) {
+                $caught = $e;
+            }
+        }));
+
+        $engine->catchUpActive();
+
+        self::assertNotNull($caught);
+        $this->assertSubscriptions(['id' => 's1', 'status' => 'ACTIVE', 'position' => 1, 'error' => null]);
+    }
+
+    public function test_reset_is_allowed_recursively_for_other_subscriptions(): void
+    {
+        $this->eventStore->append(1);
+        $this->subscriptionStore->_setSubscriptions(self::subscriptionAt('s1', SubscriptionStatus::ACTIVE, 0), self::subscriptionAt('s2', SubscriptionStatus::ERROR, 0));
+        $engine = null;
+        $engine = $this->subscriptionEngine(
+            Subscriber::create(id: 's1', handler: function () use (&$engine) {
+                $engine->reset(SubscriptionEngineCriteria::create(['s2']));
+            }),
+            Subscriber::create(id: 's2', handler: fn () => null),
+        );
+
+        self::assertTrue($engine->catchUpActive(SubscriptionEngineCriteria::create(['s1']))->successful());
+
+        $this->assertSubscriptions(
+            ['id' => 's1', 'status' => 'ACTIVE', 'position' => 1, 'error' => null],
+            ['id' => 's2', 'status' => 'BOOTING', 'position' => 0, 'error' => null],
+        );
+    }
+
+    // ---------------------
 
     public static function engineMethods(): iterable
     {
@@ -1771,7 +2101,7 @@ final class SubscriptionEngineTest extends TestCase
 
     private function assertSubscriptions(array ...$subscriptions): void
     {
-        self::assertSame($subscriptions, $this->subscriptionStore->findByCriteriaForUpdate(SubscriptionCriteria::noConstraints())->map(static fn(Subscription $subscription) => [
+        self::assertSame($subscriptions, $this->subscriptionStore->findByCriteria(SubscriptionCriteria::noConstraints())->map(static fn(Subscription $subscription) => [
             'id' => $subscription->id->value,
             'status' => $subscription->status->value,
             'position' => $subscription->position->value,

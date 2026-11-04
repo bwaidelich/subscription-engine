@@ -30,7 +30,12 @@ enum SubscriptionStatus : string
     case DETACHED = 'DETACHED';
 
     /**
-     * Subscribers that are run into an error during catchup or setup
+     * Subscribers that are run into an error during catchup, setup or reset
      */
     case ERROR = 'ERROR';
+
+    /**
+     * Subscribers whose reset function is running: Catch-ups and setup ignore them. If a reset has crashed, the subscription stays in this status until it is reset with the "force" flag
+     */
+    case RESETTING = 'RESETTING';
 }

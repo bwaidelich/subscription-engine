@@ -54,6 +54,9 @@ final class InMemorySubscriptionStore implements SubscriptionStore
 
     public function findByCriteriaForUpdate(SubscriptionCriteria $criteria): Subscriptions
     {
+        if ($this->transactionSnapshots === []) {
+            throw new \LogicException('A lock outside of a transaction is released right away');
+        }
         return $this->filterByCriteria($criteria);
     }
 

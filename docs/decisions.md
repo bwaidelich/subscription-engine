@@ -116,7 +116,7 @@ Several workers should be able to call the engine on the same set of subscriptio
 | 14 | Retrying them | The list is cleared for the criteria of a call, if the claim found nothing or a claimed active subscription had no events, or if nothing else is left to claim | The rest has no work, so the failed subscription gets one retry per cycle and a temporary error recovers by itself. `ERROR` is no option: It requires a `reset()` and a full replay |
 | 15 | Set-aside and `hasPendingEvents` | Set-aside subscriptions don't count as pending | Otherwise `while ($result->hasPendingEvents)` would never end |
 | 16 | Exceptions that still escape | From `beginTransaction()` and `claimNext()`, as no subscription is involved, and from listeners after the commit, as the batch is persisted | There is nothing to set aside, and an unavailable database must stay visible |
-| 17 | `setup()`, `reset()`, discovery | Keep blocking | Discovery would treat a locked row as missing, and `add()` would fail with a duplicate key. `setup()` and `reset()` would silently miss subscriptions |
+| 17 | `setup()`, `reset()`, discovery | Don't skip locked rows | Discovery would treat a locked row as missing, and `add()` would fail with a duplicate key. `setup()` and `reset()` would silently miss subscriptions. See [The reset() race](#the-reset-race-target-20) for how they use locks now |
 | 18 | Recursion guard | Unchanged, also for the new methods | A nested call on the same connection sees the lock of the outer run as free. The guard throws for `ids === null` and overlapping ids, so `claimNext()` can't return a subscription that is being processed |
 | 19 | Processed subscription on the result | Not part of `ProcessedResult` | `CatchUpStarted` and `CatchUpFinished` already carry it, and no caller logic needs it |
 | 20 | SQLite | Serial: `LIMIT 1` with the same ordering, without `FOR UPDATE` | `BEGIN EXCLUSIVE` already makes a second worker wait before it claims anything. Each event is still handled once, only the parallelism is lost |
@@ -136,6 +136,45 @@ Several workers should be able to call the engine on the same set of subscriptio
 
 ### Open points
 
-- `setup()` and `reset()` call `findByCriteriaForUpdate()` outside of a transaction, so the lock is released immediately and a worker can catch up while a `reset()` handler is running. This race already exists, but always-running workers make it more likely. A transaction is no simple fix, as DDL in handlers commits implicitly on MySQL. Until then: Stop workers before `reset()`.
 - A persisted failure counter that moves a subscription to `ERROR` after N failed runs would also cover short-lived processes. It requires a new column, a new field on `Subscription`, and a choice of N. It can be added later without conflicting with the set-aside.
 - The `read()` filter/query follow-up: With filtered subscriptions, a position can stay behind `lastPosition()` although no matching event is left, so `hasPendingEvents` would stay `true`.
+
+## The reset() race (target: 2.0)
+
+### Context
+
+`setup()` and `reset()` called `findByCriteriaForUpdate()` outside of a transaction, so the lock was released right away and workers kept running during the handlers. Both races were reproduced:
+
+- **`reset()`:** A worker catches up during the handler. With a subscription `ACTIVE` at position 2 and 5 events, the projection ends up with `[3,4,5,1,2,3,4,5]`: Events 3 to 5 are handled twice.
+- **`setup()`:** A worker commits during the handler of a `BOOTING` subscription and the stale position is written back. The projection ends up with `[1,2,3,1,2,3,4,5]`.
+
+Holding a transaction during the handler is no option. `TRUNCATE` and DDL commit implicitly on MySQL and MariaDB, the store then fails with "The database has ended the transaction".
+
+### Decisions
+
+| # | Topic | Decision | Why |
+|---|-------|----------|-----|
+| 1 | Keeping workers out of `reset()` | A status fence: A short transaction waits for the row locks and sets `SubscriptionStatus::RESETTING`, which no catch-up matches. The handlers run without a lock, then the subscription goes to `BOOTING` at position 0 | Waiting for the lock also waits for in-flight runs. Handlers can use DDL. The store contract stays unchanged, a status is no schema change |
+| 2 | Fixing `setup()` | The handlers keep running without lock and fence. The status change happens in a short transaction on a freshly read row | A fence would stop all workers during every `setup()`. Setup handlers have to stay compatible with running event handlers |
+| 3 | Scope | 2.0 only, no backport to 1.x. The upgrade notes warn about 1.x | The new status could break consumers with an exhaustive `match` |
+| 4 | Scope of the fence | One transaction for all matching subscriptions that have a subscriber. If a lock can't be acquired: Roll back, rethrow, nothing changed. Subscriptions without subscriber keep `SubscriberNotFound` and don't change | All workers have stopped before the first handler runs, which protects handlers that clear a table shared by several subscriptions |
+| 5 | Failing reset handler | The subscription goes to `ERROR`, with an unchanged position and the status before the fence as `previousStatus`. The others continue, and the result is failed | Keeping the previous status, as before, lets workers continue on a half-cleared projection. `ERROR` is ignored by catch-ups and `setup()`, and `reset()` retries it |
+| 6 | Already `RESETTING` | `reset()` does not run the handler. It dispatches `ResetAlreadyInProgress` at warning level and reports an `Error`, the others continue. `reset($criteria, force: true)` takes over | Another reset is running or one has crashed, and the engine can't tell which. Proceeding would let a second handler clear rows of a boot that the first reset has started. Any timeout based on `last_saved_at` is wrong for some long handler and depends on clocks |
+| 7 | Exception escaping the final write | The exception escapes. That subscription and the remaining ones of the call stay `RESETTING` | The database may be gone. `force: true` recovers, and the handlers run again |
+| 8 | Reads in `setup()` | Discovery and the main list use `findByCriteria()` | Outside of a transaction the lock had no effect, they only waited for running catch-ups |
+| 9 | Transition in `setup()` | Per subscription: Lock the row if it is still `NEW`, `BOOTING` or `ACTIVE`, and decide by that fresh state. `NEW` goes to `BOOTING`. With `FROM_NOW`, `NEW` and `BOOTING` go to `ACTIVE` at `lastPosition()`. `BOOTING` with `FROM_BEGINNING` and `ACTIVE` are not written. Any other status is left alone. An exception rolls back and is rethrown | A position written by a worker can't regress, and the fence of a concurrent `reset()` isn't overwritten |
+| 10 | Failing setup handler, detaching | Same short transaction: `ERROR` or `DETACHED` on the fresh row, only if it still matches | A failing handler must not write a stale position either |
+| 11 | Recursion guard | `setup()` and `reset()` throw `RecursiveCatchUpException` if called during a catch-up with `ids === null` or overlapping ids. The name stays, a second class isn't worth it | On the same connection the fence wouldn't wait for the lock of the outer run and its commit wouldn't end the outer transaction. The outer run would then overwrite `RESETTING` with `ACTIVE`. A catch-up called from a reset handler needs no guard, it finds nothing because of the fence |
+| 12 | Engine events | `SubscriberWasReset` reports the status from before the fence. Events of the fence are dispatched after its commit | The change from `ACTIVE` to `BOOTING` is what the log should say. A listener must not be able to roll back the fence |
+| 13 | Tests | Engine tests that run a worker inside the handler, two-connection tests for lock waits, and worker processes on all databases running `reset()` with a `TRUNCATE` handler | Implicit commits and the lock behavior of a status change can't be observed in memory |
+
+### Known consequences
+
+- **New status value.** Code with an exhaustive `match` on `SubscriptionStatus` has to handle `RESETTING`. Stores with a string column need no change.
+- **The fence can deadlock with a blocking worker on MySQL and MariaDB.** The worker holds a record of the `status` index and waits for the primary key, the fence holds the primary key and needs that index record for its `UPDATE`. Reproduced on MariaDB 11.4 in 2 of 6 test runs with 4 resets each, not on MySQL 8.4 or PostgreSQL 17. Whichever side is rolled back has changed nothing: `reset()` throws and can be repeated, a catch-up repeats its batch. Workers using `claimNext()` hold no such index record.
+- **A long catch-up delays the fence.** `reset()` waits for running batches, and rows that are already locked wait with it. Bounded runs shorten that.
+- **A crashed `reset()` stays visible.** The subscription stays `RESETTING` and receives no events until someone calls `reset($criteria, force: true)`. Calling that while the other reset is still running recreates the race.
+- **`force: true` runs the handler again.** Reset handlers have to tolerate running twice.
+- **Handlers of one call run in sequence.** All subscriptions of the call stay fenced until their handler is done.
+- **Setup handlers run while workers are active.** A handler that needs exclusive access requires stopped workers.
+- **Concurrent discovery can fail.** Two simultaneous `setup()` calls can both `add()` the same new subscription, the second one fails with a duplicate key. That is loud, a retry fixes it and no data is damaged. A fix requires an upsert in the store contract.
