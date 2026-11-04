@@ -17,6 +17,7 @@ use Wwwision\SubscriptionEngine\Engine\EngineEvent\FailedToResetSubscriber;
 use Wwwision\SubscriptionEngine\Engine\EngineEvent\FailedToSetupSubscriber;
 use Wwwision\SubscriptionEngine\Engine\EngineEvent\NoResetResetFunctionDefined;
 use Wwwision\SubscriptionEngine\Engine\EngineEvent\NoSubscriptionsFound;
+use Wwwision\SubscriptionEngine\Engine\EngineEvent\ResetAlreadyInProgress;
 use Wwwision\SubscriptionEngine\Engine\EngineEvent\ResetStarted;
 use Wwwision\SubscriptionEngine\Engine\EngineEvent\SetupStarted;
 use Wwwision\SubscriptionEngine\Engine\EngineEvent\SubscriberFailedToHandleEvent;
@@ -94,16 +95,13 @@ final class SubscriptionEngine
     {
         $criteria ??= SubscriptionEngineCriteria::noConstraints();
         $this->assertKnownSubscriptionIds($criteria);
+        $subscriptionCriteria = SubscriptionCriteria::forEngineCriteriaAndStatus($criteria, self::statusesToSetUp());
+        $this->assertNoRecursiveCall($subscriptionCriteria);
         $this->dispatchEngineEvent(new SetupStarted());
 
         $this->subscriptionStore->setup();
         $this->discoverNewSubscriptions();
-        $subscriptionCriteria = SubscriptionCriteria::forEngineCriteriaAndStatus($criteria, SubscriptionStatusFilter::fromArray([
-            SubscriptionStatus::NEW,
-            SubscriptionStatus::BOOTING,
-            SubscriptionStatus::ACTIVE
-        ]));
-        $subscriptions = $this->subscriptionStore->findByCriteriaForUpdate($subscriptionCriteria);
+        $subscriptions = $this->subscriptionStore->findByCriteria($subscriptionCriteria);
         if ($subscriptions->isEmpty()) {
             $this->dispatchEngineEvent(new NoSubscriptionsFound($subscriptionCriteria));
             return Result::success();
@@ -148,20 +146,26 @@ final class SubscriptionEngine
         return $this->catchUpNext($criteria ?? SubscriptionEngineCriteria::noConstraints(), SubscriptionStatus::BOOTING, $limit);
     }
 
-    public function reset(SubscriptionEngineCriteria|null $criteria = null): Result
+    /**
+     * Waits for running catch-ups and keeps new ones out with the status {@see SubscriptionStatus::RESETTING}, while the reset functions run without a lock
+     *
+     * @param bool $force Whether to take over subscriptions that are already {@see SubscriptionStatus::RESETTING}. Only use this if the process that started the reset is gone
+     */
+    public function reset(SubscriptionEngineCriteria|null $criteria = null, bool $force = false): Result
     {
         $criteria ??= SubscriptionEngineCriteria::noConstraints();
         $this->assertKnownSubscriptionIds($criteria);
-        $this->dispatchEngineEvent(new ResetStarted());
         $subscriptionCriteria = SubscriptionCriteria::forEngineCriteriaAndStatus($criteria, SubscriptionStatusFilter::any());
-        $subscriptions = $this->subscriptionStore->findByCriteriaForUpdate($subscriptionCriteria);
+        $this->assertNoRecursiveCall($subscriptionCriteria);
+        $this->dispatchEngineEvent(new ResetStarted());
+        $subscriptions = $this->fenceSubscriptions($subscriptionCriteria, $force);
         if ($subscriptions->isEmpty()) {
             $this->dispatchEngineEvent(new NoSubscriptionsFound($subscriptionCriteria));
             return Result::success();
         }
         $errors = [];
         foreach ($subscriptions as $subscription) {
-            $error = $this->resetSubscription($subscription);
+            $error = $this->resetSubscription($subscription, $force);
             if ($error !== null) {
                 $errors[] = $error;
             }
@@ -214,7 +218,7 @@ final class SubscriptionEngine
      */
     private function discoverNewSubscriptions(): void
     {
-        $subscriptions = $this->subscriptionStore->findByCriteriaForUpdate(SubscriptionCriteria::noConstraints());
+        $subscriptions = $this->subscriptionStore->findByCriteria(SubscriptionCriteria::noConstraints());
         foreach ($this->subscribers as $subscriber) {
             if ($subscriptions->contain($subscriber->id)) {
                 continue;
@@ -233,15 +237,26 @@ final class SubscriptionEngine
     /**
      * Set up the subscription by retrieving the corresponding subscriber and calling the setUp method on its handler
      * If the setup fails, the subscription will be in the {@see SubscriptionStatus::ERROR} state and a corresponding {@see Error} is returned
+     *
+     * The handler runs without a lock, so that it can use DDL. A worker can change the subscription in the meantime, so the transition is decided by its fresh state
      */
     private function setupSubscription(Subscription $subscription): ?Error
     {
         if (!$this->subscribers->contain($subscription->id)) {
             // mark detached subscriptions as we cannot set up
             $this->dispatchEngineEvent(new SubscriberNotFound($subscription));
-            $subscription = $subscription->with(status: SubscriptionStatus::DETACHED);
-            $this->subscriptionStore->update($subscription);
-            $this->dispatchEngineEvent(new SubscriptionDetached($subscription));
+            $detached = $this->transactional(function () use ($subscription) {
+                $freshSubscription = $this->findSubscriptionToSetUpForUpdate($subscription->id);
+                if ($freshSubscription === null) {
+                    return null;
+                }
+                $detached = $freshSubscription->with(status: SubscriptionStatus::DETACHED);
+                $this->subscriptionStore->update($detached);
+                return $detached;
+            });
+            if ($detached !== null) {
+                $this->dispatchEngineEvent(new SubscriptionDetached($detached));
+            }
             return null;
         }
 
@@ -251,30 +266,89 @@ final class SubscriptionEngine
                 ($subscriber->setup)();
             } catch (Throwable $e) {
                 $this->dispatchEngineEvent(new FailedToSetupSubscriber($subscription, $e));
-                $this->subscriptionStore->update($subscription->withError(SubscriptionError::fromPreviousStatusAndException($subscription->status, $e)));
+                $this->transactional(function () use ($subscription, $e) {
+                    $freshSubscription = $this->findSubscriptionToSetUpForUpdate($subscription->id);
+                    if ($freshSubscription !== null) {
+                        $this->subscriptionStore->update($freshSubscription->withError(SubscriptionError::fromPreviousStatusAndException($freshSubscription->status, $e)));
+                    }
+                });
                 return Error::create($subscription->id, $e->getMessage(), $e, null);
             }
         }
 
-        if ($subscription->status === SubscriptionStatus::ACTIVE) {
-            $this->dispatchEngineEvent(new ActiveSubscriptionSetup($subscription));
+        $freshSubscription = $this->transactional(function () use ($subscription) {
+            $freshSubscription = $this->findSubscriptionToSetUpForUpdate($subscription->id);
+            if ($freshSubscription === null || $freshSubscription->status === SubscriptionStatus::ACTIVE) {
+                return $freshSubscription;
+            }
+            if ($freshSubscription->runMode === RunMode::FROM_NOW) {
+                $this->subscriptionStore->update($freshSubscription->with(status: SubscriptionStatus::ACTIVE, position: $this->eventStoreAdapter->lastPosition()));
+            } elseif ($freshSubscription->status === SubscriptionStatus::NEW) {
+                $this->subscriptionStore->update($freshSubscription->with(status: SubscriptionStatus::BOOTING));
+            }
+            return $freshSubscription;
+        });
+        if ($freshSubscription === null) {
             return null;
         }
-        if ($subscription->runMode === RunMode::FROM_NOW) {
-            $this->subscriptionStore->update($subscription->with(status: SubscriptionStatus::ACTIVE, position: $this->eventStoreAdapter->lastPosition()));
-            $this->dispatchEngineEvent(new SubscriberWasSetup($subscription, SubscriptionStatus::ACTIVE, $subscription->status));
+        if ($freshSubscription->status === SubscriptionStatus::ACTIVE) {
+            $this->dispatchEngineEvent(new ActiveSubscriptionSetup($freshSubscription));
             return null;
         }
-        $this->subscriptionStore->update($subscription->with(status: SubscriptionStatus::BOOTING));
-        $this->dispatchEngineEvent(new SubscriberWasSetup($subscription, SubscriptionStatus::BOOTING, $subscription->status));
+        $this->dispatchEngineEvent(new SubscriberWasSetup($freshSubscription, $freshSubscription->runMode === RunMode::FROM_NOW ? SubscriptionStatus::ACTIVE : SubscriptionStatus::BOOTING, $freshSubscription->status));
         return null;
     }
 
-    private function resetSubscription(Subscription $subscription): ?Error
+    private static function statusesToSetUp(): SubscriptionStatusFilter
+    {
+        return SubscriptionStatusFilter::fromArray([
+            SubscriptionStatus::NEW,
+            SubscriptionStatus::BOOTING,
+            SubscriptionStatus::ACTIVE,
+        ]);
+    }
+
+    /**
+     * @return Subscription|null The current state of the subscription, or NULL if it must not be set up anymore, for example because a reset has started in the meantime
+     */
+    private function findSubscriptionToSetUpForUpdate(SubscriptionId $subscriptionId): Subscription|null
+    {
+        $subscriptions = $this->subscriptionStore->findByCriteriaForUpdate(SubscriptionCriteria::create(SubscriptionIds::fromArray([$subscriptionId]), self::statusesToSetUp()));
+        return $subscriptions->contain($subscriptionId) ? $subscriptions->get($subscriptionId) : null;
+    }
+
+    /**
+     * Waits for the locks of all matching subscriptions and sets the status that no catch-up matches, in one transaction: Once this returns, none of them is being processed anymore
+     *
+     * @return Subscriptions The state of the subscriptions before this call
+     */
+    private function fenceSubscriptions(SubscriptionCriteria $subscriptionCriteria, bool $force): Subscriptions
+    {
+        return $this->transactional(function () use ($subscriptionCriteria, $force) {
+            $subscriptions = $this->subscriptionStore->findByCriteriaForUpdate($subscriptionCriteria);
+            foreach ($subscriptions as $subscription) {
+                if (!$this->subscribers->contain($subscription->id) || (!$force && $subscription->status === SubscriptionStatus::RESETTING)) {
+                    continue;
+                }
+                $this->subscriptionStore->update($subscription->with(status: SubscriptionStatus::RESETTING));
+            }
+            return $subscriptions;
+        });
+    }
+
+    /**
+     * @param Subscription $subscription The state before {@see self::fenceSubscriptions()}
+     */
+    private function resetSubscription(Subscription $subscription, bool $force): ?Error
     {
         if (!$this->subscribers->contain($subscription->id)) {
             $this->dispatchEngineEvent(new SubscriberNotFound($subscription));
             return null;
+        }
+        if (!$force && $subscription->status === SubscriptionStatus::RESETTING) {
+            $event = new ResetAlreadyInProgress($subscription);
+            $this->dispatchEngineEvent($event);
+            return Error::create($subscription->id, (string)$event, null, null);
         }
         $subscriber = $this->subscribers->get($subscription->id);
         if ($subscriber->reset === null) {
@@ -284,12 +358,32 @@ final class SubscriptionEngine
                 ($subscriber->reset)();
             } catch (Throwable $e) {
                 $this->dispatchEngineEvent(new FailedToResetSubscriber($subscription, $e));
+                // the projection may be partially cleared, so no catch-up must continue on it
+                $this->subscriptionStore->update($subscription->withError(SubscriptionError::fromPreviousStatusAndException($subscription->status, $e)));
                 return Error::create($subscription->id, $e->getMessage(), $e, null);
             }
         }
         $this->subscriptionStore->update($subscription->with(status: SubscriptionStatus::BOOTING, position: Position::none())->withoutError());
         $this->dispatchEngineEvent(new SubscriberWasReset($subscription, $subscription->status, SubscriptionStatus::BOOTING));
         return null;
+    }
+
+    /**
+     * @template T
+     * @param callable(): T $callback
+     * @return T
+     */
+    private function transactional(callable $callback): mixed
+    {
+        $this->subscriptionStore->beginTransaction();
+        try {
+            $result = $callback();
+            $this->subscriptionStore->commit();
+            return $result;
+        } catch (Throwable $e) {
+            $this->rollbackTransaction();
+            throw $e;
+        }
     }
 
     private function catchUpSubscriptions(SubscriptionEngineCriteria $criteria, SubscriptionStatusFilter $status, int|null $limit): ProcessedResult
@@ -469,12 +563,23 @@ final class SubscriptionEngine
         $this->dispatchEngineEvent(new CatchUpInitiated($criteria, $status));
 
         $subscriptionCriteria = SubscriptionCriteria::forEngineCriteriaAndStatus($criteria, $status);
-        if (!$this->processingSubscriptions->isEmpty()) {
-            if ($subscriptionCriteria->ids === null || !$subscriptionCriteria->ids->intersection($this->processingSubscriptions)->isEmpty()) {
-                throw RecursiveCatchUpException::forSubscriptionIds($this->processingSubscriptions, $subscriptionCriteria->ids);
-            }
-        }
+        $this->assertNoRecursiveCall($subscriptionCriteria);
         return $subscriptionCriteria;
+    }
+
+    /**
+     * On the same connection, a lock of the running catch-up looks free. Its commit would also overwrite whatever a nested call has changed
+     *
+     * @throws RecursiveCatchUpException
+     */
+    private function assertNoRecursiveCall(SubscriptionCriteria $subscriptionCriteria): void
+    {
+        if ($this->processingSubscriptions->isEmpty()) {
+            return;
+        }
+        if ($subscriptionCriteria->ids === null || !$subscriptionCriteria->ids->intersection($this->processingSubscriptions)->isEmpty()) {
+            throw RecursiveCatchUpException::forSubscriptionIds($this->processingSubscriptions, $subscriptionCriteria->ids);
+        }
     }
 
     /**

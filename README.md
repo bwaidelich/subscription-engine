@@ -80,9 +80,15 @@ The engine instance leaves it out of its next claims, so it can't starve the oth
 > [!WARNING]
 > This state is kept per engine instance. A process that makes a single call and exits runs into a failing subscription every time and starves the others, so workers have to loop within the process. Always check `successful()`, a repeating failure is otherwise only visible through the `SubscriberFailedToHandleEvent` and `CatchUpRunFailed` engine events.
 
-### Stop workers before `reset()`
+### `reset()` and `setup()` with running workers
 
-`setup()` and `reset()` don't skip locked subscriptions, but they don't hold locks either. A worker can catch up a subscription while its `reset()` handler is running.
+Workers don't have to be stopped. `reset()` waits for running catch-ups and sets the status `RESETTING`, which no catch-up matches, for all matching subscriptions. The reset functions then run without a lock, so they can use DDL like `TRUNCATE`, and each subscription goes to `BOOTING` at position 0 afterwards.
+
+- If a reset function fails, the subscription goes to `ERROR` and no worker continues on the partially cleared projection. Call `reset()` again to retry
+- If a subscription is already `RESETTING`, another reset is running or has crashed. `reset()` skips it and reports an error. Once you know that the other process is gone, take over with `reset($criteria, force: true)`. This runs the reset function again
+- `reset()` throws if it can't get the locks in time or runs into a deadlock with a blocking worker, which is possible on MySQL and MariaDB. Nothing has changed in that case and the call can be repeated
+
+`setup()` does not stop workers: Its functions run while events are being handled, so they have to stay compatible with the running code. Stop the workers for a setup that needs exclusive access.
 
 See [docs/decisions.md](./docs/decisions.md) for the reasoning.
 
@@ -130,6 +136,11 @@ public function claimNext(SubscriptionCriteria $criteria): Subscription|null;
 ```
 
 It locks and returns the matching subscription with the lowest position that is not locked by another process, with ties broken by id, without waiting for locks. It must not lock any other subscription, and has to return the state at the time of the lock.
+
+`SubscriptionStatus` has the new case `RESETTING`, code with an exhaustive `match` has to handle it. A failing reset function now moves the subscription to `ERROR`, it used to keep its status.
+
+> [!WARNING]
+> Up to 1.x workers keep running during `setup()` and `reset()`, which can handle events twice or write back an old position. On 1.x stop all workers for both. If workers were running during one of those calls, `reset()` and replay the affected subscriptions.
 
 > [!WARNING]
 > Up to 1.x a deadlock inside a subscriber handler on MySQL or MariaDB could persist positions without the events they stand for, for all subscriptions of that run. This can't be detected afterwards. If such deadlocks occurred, `reset()` and replay the affected subscriptions.
