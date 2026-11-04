@@ -117,7 +117,7 @@ final class SubscriptionEngineTest extends TestCase
         $this->assertEmittedEngineEvents(
             'SetupStarted: Start to setup',
             'SubscriptionDiscovered: New Subscriber "s1" was found and added to the subscription store',
-            'SubscriberWasSetup: Subscriber for "s1" has been setup, changing status from BOOTING to NEW',
+            'SubscriberWasSetup: Subscriber for "s1" has been setup, changing status from NEW to BOOTING',
         );
         self::assertTrue($result->successful());
     }
@@ -137,7 +137,7 @@ final class SubscriptionEngineTest extends TestCase
         $this->assertEmittedEngineEvents(
             'SetupStarted: Start to setup',
             'SubscriptionDiscovered: New Subscriber "s1" was found and added to the subscription store',
-            'SubscriberWasSetup: Subscriber for "s1" has been setup, changing status from ACTIVE to NEW',
+            'SubscriberWasSetup: Subscriber for "s1" has been setup, changing status from NEW to ACTIVE',
         );
         self::assertTrue($result->successful());
     }
