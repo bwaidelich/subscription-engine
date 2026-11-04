@@ -295,7 +295,7 @@ final class SubscriptionEngine
             $this->dispatchEngineEvent(new ActiveSubscriptionSetup($freshSubscription));
             return null;
         }
-        $this->dispatchEngineEvent(new SubscriberWasSetup($freshSubscription, $freshSubscription->runMode === RunMode::FROM_NOW ? SubscriptionStatus::ACTIVE : SubscriptionStatus::BOOTING, $freshSubscription->status));
+        $this->dispatchEngineEvent(new SubscriberWasSetup($freshSubscription, previousStatus: $freshSubscription->status, newStatus: $freshSubscription->runMode === RunMode::FROM_NOW ? SubscriptionStatus::ACTIVE : SubscriptionStatus::BOOTING));
         return null;
     }
 
