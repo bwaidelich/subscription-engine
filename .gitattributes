@@ -1,1 +1,10 @@
 /.editorconfig export-ignore
+/.gitattributes export-ignore
+/.github export-ignore
+/.gitignore export-ignore
+/phpcs.xml export-ignore
+/phpstan.neon export-ignore
+/phpstan.neon.dist export-ignore
+/phpunit.xml export-ignore
+# The in-memory mocks stay, the tests of other packages use them
+/tests/PHPUnit export-ignore
