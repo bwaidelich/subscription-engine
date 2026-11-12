@@ -39,7 +39,6 @@ use Wwwision\SubscriptionEngine\Engine\SubscriptionEngineCriteria;
 use Wwwision\SubscriptionEngine\EventStore\EventStoreAdapter;
 use Wwwision\SubscriptionEngine\Store\SubscriptionCriteria;
 use Wwwision\SubscriptionEngine\Store\SubscriptionStore;
-use Wwwision\SubscriptionEngine\Subscriber\Subscriber;
 use Wwwision\SubscriptionEngine\Subscriber\Subscribers;
 use Wwwision\SubscriptionEngine\Subscription\Position;
 use Wwwision\SubscriptionEngine\Subscription\RunMode;
@@ -64,13 +63,6 @@ final class SubscriptionEngine
     private array $engineEventSubscribers = [];
 
     private SubscriptionIds $processingSubscriptions;
-
-    /**
-     * Subscriptions whose last run failed, by status. They are left out of the next claims, see {@see self::catchUpNext()}
-     *
-     * @var array<string, SubscriptionIds>
-     */
-    private array $setAsideSubscriptions = [];
 
     /**
      * @param EventStoreAdapter<E> $eventStoreAdapter
@@ -431,34 +423,26 @@ final class SubscriptionEngine
     /**
      * Claims the next available subscription and catches it up in its own transaction.
      *
-     * A run that fails after the claim rolls back and returns a failed result instead of throwing: With lowest position first, a subscription whose run keeps failing
-     * would be claimed first forever. So it is set aside and only retried once the others have nothing left to do. A worker that is restarted because of an exception would never get to that point.
+     * A run that fails after the claim rolls back and returns a failed result with the id of the subscription instead of throwing.
+     * The engine keeps no memory of it: With lowest position first, the same subscription is claimed again by the next call, unless the caller leaves it out
      */
     private function catchUpNext(SubscriptionEngineCriteria $criteria, SubscriptionStatus $status, int|null $limit): ProcessedResult
     {
         $subscriptionCriteria = $this->prepareCatchUp($criteria, SubscriptionStatusFilter::fromStatus($status), $limit);
-        $claimCriteria = $this->withoutSetAsideSubscriptions($subscriptionCriteria, $status);
-        if ($claimCriteria === null) {
-            // nothing else is left to do
-            $this->retrySetAsideSubscriptions($subscriptionCriteria, $status);
-            $claimCriteria = $subscriptionCriteria;
-        }
-
         $this->subscriptionStore->beginTransaction();
         $processingSubscriptionsBackup = $this->processingSubscriptions;
         $claimed = null;
         $committed = false;
         try {
-            $claimed = $this->claimNextWithSubscriber($claimCriteria);
+            $claimed = $this->claimNextWithSubscriber($subscriptionCriteria);
             if ($claimed === null) {
                 $this->subscriptionStore->commit();
                 $committed = true;
-                $this->retrySetAsideSubscriptions($subscriptionCriteria, $status);
-                if ($this->subscriptionStore->findByCriteria($claimCriteria)->isEmpty()) {
-                    $this->dispatchEngineEvent(new NoSubscriptionsFound($claimCriteria));
+                if ($this->subscriptionStore->findByCriteria($subscriptionCriteria)->isEmpty()) {
+                    $this->dispatchEngineEvent(new NoSubscriptionsFound($subscriptionCriteria));
                     return ProcessedResult::success(0);
                 }
-                $this->dispatchEngineEvent(new AllSubscriptionsLocked($claimCriteria));
+                $this->dispatchEngineEvent(new AllSubscriptionsLocked($subscriptionCriteria));
                 return ProcessedResult::locked();
             }
             $this->processingSubscriptions = $this->processingSubscriptions->merge(SubscriptionIds::fromArray([$claimed->id]));
@@ -467,8 +451,7 @@ final class SubscriptionEngine
             $this->subscriptionStore->commit();
             $committed = true;
             if ($status === SubscriptionStatus::ACTIVE && $numberOfProcessedEvents === 0) {
-                // the claimed subscription had the lowest position, so all others that are not locked or set aside are at the end of the event log, too
-                $this->retrySetAsideSubscriptions($subscriptionCriteria, $status);
+                // the claimed subscription had the lowest position, so all others that are not locked are at the end of the event log, too
                 $hasPendingEvents = false;
             } else {
                 $hasPendingEvents = $this->hasPendingSubscriptions($subscriptionCriteria, $status);
@@ -484,7 +467,6 @@ final class SubscriptionEngine
             if ($claimed === null) {
                 throw $e;
             }
-            $this->setAsideSubscriptions[$status->value] = ($this->setAsideSubscriptions[$status->value] ?? SubscriptionIds::none())->merge(SubscriptionIds::fromArray([$claimed->id]));
             $this->dispatchEngineEvent(new CatchUpRunFailed($claimed, $e));
             return ProcessedResult::failed(0, Errors::fromArray([Error::create($claimed->id, $e->getMessage(), $e, null)]), $this->hasPendingSubscriptions($subscriptionCriteria, $status));
         } finally {
@@ -493,40 +475,12 @@ final class SubscriptionEngine
     }
 
     /**
-     * @return SubscriptionCriteria|null The narrowed criteria, or NULL if all matching subscriptions are set aside
-     */
-    private function withoutSetAsideSubscriptions(SubscriptionCriteria $subscriptionCriteria, SubscriptionStatus $status): SubscriptionCriteria|null
-    {
-        $setAside = $this->setAsideSubscriptions[$status->value] ?? SubscriptionIds::none();
-        if ($setAside->isEmpty()) {
-            return $subscriptionCriteria;
-        }
-        $ids = $subscriptionCriteria->ids ?? SubscriptionIds::fromArray(array_map(static fn (Subscriber $subscriber) => $subscriber->id, iterator_to_array($this->subscribers, false)));
-        $remainingIds = $ids->without($setAside);
-        return $remainingIds->isEmpty() ? null : SubscriptionCriteria::create($remainingIds, $subscriptionCriteria->status);
-    }
-
-    private function retrySetAsideSubscriptions(SubscriptionCriteria $subscriptionCriteria, SubscriptionStatus $status): void
-    {
-        if ($subscriptionCriteria->ids === null) {
-            unset($this->setAsideSubscriptions[$status->value]);
-            return;
-        }
-        if (isset($this->setAsideSubscriptions[$status->value])) {
-            $this->setAsideSubscriptions[$status->value] = $this->setAsideSubscriptions[$status->value]->without($subscriptionCriteria->ids);
-        }
-    }
-
-    /**
      * Whether a next run could process more: A booting subscription has at least to be activated, an active one has to be behind the event log
+     * A subscription whose run failed counts as well, as it is still behind
      */
     private function hasPendingSubscriptions(SubscriptionCriteria $subscriptionCriteria, SubscriptionStatus $status): bool
     {
-        $remainingCriteria = $this->withoutSetAsideSubscriptions($subscriptionCriteria, $status);
-        if ($remainingCriteria === null) {
-            return false;
-        }
-        $subscriptions = $this->subscriptionStore->findByCriteria($remainingCriteria);
+        $subscriptions = $this->subscriptionStore->findByCriteria($subscriptionCriteria);
         if ($status === SubscriptionStatus::BOOTING) {
             return !$subscriptions->isEmpty();
         }
