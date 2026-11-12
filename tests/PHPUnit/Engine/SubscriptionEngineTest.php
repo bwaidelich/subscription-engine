@@ -1850,7 +1850,7 @@ final class SubscriptionEngineTest extends TestCase
 
         self::assertFalse($result->successful());
         self::assertSame(0, $result->numberOfProcessedEvents);
-        self::assertFalse($result->hasPendingEvents);
+        self::assertTrue($result->hasPendingEvents, 'The subscription is still behind');
         $error = iterator_to_array($result->errors)[0];
         self::assertSame('s1', $error->subscriptionId->value);
         self::assertSame('Update of s1 failed', $error->message);
@@ -1877,7 +1877,38 @@ final class SubscriptionEngineTest extends TestCase
         self::assertFalse($this->subscriptionStore->_isTransactionActive());
     }
 
-    public function test_catchUpNextActive_lets_a_failing_subscription_not_starve_the_others(): void
+    public function test_catchUpNextActive_claims_a_failing_subscription_again_on_the_next_call(): void
+    {
+        $this->eventStore->append('event at #1');
+        $this->eventStore->append('event at #2');
+        $this->subscriptionStore->_setSubscriptions(
+            self::subscriptionAt('poison', SubscriptionStatus::ACTIVE, 0),
+            self::subscriptionAt('s1', SubscriptionStatus::ACTIVE, 1),
+        );
+        $this->subscriptionStore->_failOnUpdateOf('poison');
+        $attempts = 0;
+        $subscriptionEngine = $this->subscriptionEngine(
+            Subscriber::create(SubscriptionId::fromString('poison'), static function () use (&$attempts) {
+                $attempts++;
+                throw new \RuntimeException('Poisoned');
+            }),
+            Subscriber::create(SubscriptionId::fromString('s1'), fn() => null),
+        );
+
+        $first = $subscriptionEngine->catchUpNextActive();
+        $second = $subscriptionEngine->catchUpNextActive();
+
+        self::assertFalse($first->successful());
+        self::assertFalse($second->successful());
+        self::assertTrue($second->hasPendingEvents);
+        self::assertSame(2, $attempts, 'The engine keeps no memory of failed runs');
+        $this->assertSubscriptions(
+            ['id' => 'poison', 'status' => 'ACTIVE', 'position' => 0, 'error' => null],
+            ['id' => 's1', 'status' => 'ACTIVE', 'position' => 1, 'error' => null],
+        );
+    }
+
+    public function test_catchUpNextActive_lets_the_others_continue_if_the_caller_leaves_a_failing_subscription_out(): void
     {
         $this->eventStore->append('event at #1');
         $this->eventStore->append('event at #2');
@@ -1894,9 +1925,13 @@ final class SubscriptionEngineTest extends TestCase
         );
 
         $failures = 0;
+        $criteria = null;
         do {
-            $result = $subscriptionEngine->catchUpNextActive();
-            $failures += $result->successful() ? 0 : 1;
+            $result = $subscriptionEngine->catchUpNextActive($criteria);
+            if (!$result->successful()) {
+                $failures++;
+                $criteria = SubscriptionEngineCriteria::create(['s1', 's2']);
+            }
         } while ($result->hasPendingEvents);
 
         self::assertSame(1, $failures);
@@ -1907,103 +1942,7 @@ final class SubscriptionEngineTest extends TestCase
         );
     }
 
-    public function test_catchUpNextActive_retries_a_failed_subscription_once_the_others_have_no_work(): void
-    {
-        $this->eventStore->append('event at #1');
-        $this->subscriptionStore->_setSubscriptions(
-            self::subscriptionAt('flaky', SubscriptionStatus::ACTIVE, 0),
-            self::subscriptionAt('s1', SubscriptionStatus::ACTIVE, 1),
-        );
-        $this->subscriptionStore->_failOnUpdateOf('flaky');
-        $attempts = 0;
-        $flaky = Subscriber::create(SubscriptionId::fromString('flaky'), function () use (&$attempts) {
-            $attempts++;
-            if ($attempts === 1) {
-                throw new \RuntimeException('Temporary');
-            }
-            $this->subscriptionStore->_failOnUpdateOf();
-        });
-        $subscriptionEngine = $this->subscriptionEngine($flaky, Subscriber::create(SubscriptionId::fromString('s1'), fn() => null));
-
-        self::assertFalse($subscriptionEngine->catchUpNextActive()->successful());
-        self::assertSame(0, $subscriptionEngine->catchUpNextActive()->numberOfProcessedEvents, 'Claims s1, which has no work');
-        self::assertSame(1, $attempts);
-        $result = $subscriptionEngine->catchUpNextActive();
-
-        self::assertTrue($result->successful());
-        self::assertSame(2, $attempts);
-        $this->assertSubscriptions(
-            ['id' => 'flaky', 'status' => 'ACTIVE', 'position' => 1, 'error' => null],
-            ['id' => 's1', 'status' => 'ACTIVE', 'position' => 1, 'error' => null],
-        );
-    }
-
-    public function test_catchUpNextActive_retries_a_failed_subscription_right_away_if_nothing_else_matches(): void
-    {
-        $this->eventStore->append('event at #1');
-        $this->subscriptionStore->_setSubscriptions(self::subscriptionAt('poison', SubscriptionStatus::ACTIVE, 0));
-        $this->subscriptionStore->_failOnUpdateOf('poison');
-        $attempts = 0;
-        $subscriptionEngine = $this->subscriptionEngine(Subscriber::create(SubscriptionId::fromString('poison'), static function () use (&$attempts) {
-            $attempts++;
-            throw new \RuntimeException('Poisoned');
-        }));
-
-        $subscriptionEngine->catchUpNextActive();
-        $subscriptionEngine->catchUpNextActive();
-
-        self::assertSame(2, $attempts);
-    }
-
-    public function test_an_idle_boot_does_not_retry_active_subscriptions_that_were_set_aside(): void
-    {
-        $this->eventStore->append('event at #1');
-        $this->subscriptionStore->_setSubscriptions(
-            self::subscriptionAt('poison', SubscriptionStatus::ACTIVE, 0),
-            self::subscriptionAt('s1', SubscriptionStatus::ACTIVE, 0),
-        );
-        $this->subscriptionStore->_failOnUpdateOf('poison');
-        $subscriptionEngine = $this->subscriptionEngine($this->poisonedSubscriber('poison'), Subscriber::create(SubscriptionId::fromString('s1'), fn() => null));
-
-        $subscriptionEngine->catchUpNextActive();
-        $subscriptionEngine->bootNext();
-        $result = $subscriptionEngine->catchUpNextActive();
-
-        self::assertTrue($result->successful());
-        $this->assertSubscriptions(
-            ['id' => 'poison', 'status' => 'ACTIVE', 'position' => 0, 'error' => null],
-            ['id' => 's1', 'status' => 'ACTIVE', 'position' => 1, 'error' => null],
-        );
-    }
-
-    public function test_an_idle_run_only_retries_failed_subscriptions_of_its_criteria(): void
-    {
-        $this->eventStore->append('event at #1');
-        $this->subscriptionStore->_setSubscriptions(
-            self::subscriptionAt('poison', SubscriptionStatus::ACTIVE, 0),
-            self::subscriptionAt('s1', SubscriptionStatus::ACTIVE, 0),
-            self::subscriptionAt('idle', SubscriptionStatus::ACTIVE, 1),
-        );
-        $this->subscriptionStore->_failOnUpdateOf('poison');
-        $subscriptionEngine = $this->subscriptionEngine(
-            $this->poisonedSubscriber('poison'),
-            Subscriber::create(SubscriptionId::fromString('s1'), fn() => null),
-            Subscriber::create(SubscriptionId::fromString('idle'), fn() => null),
-        );
-
-        $subscriptionEngine->catchUpNextActive();
-        self::assertSame(0, $subscriptionEngine->catchUpNextActive(SubscriptionEngineCriteria::create(['idle']))->numberOfProcessedEvents);
-        $result = $subscriptionEngine->catchUpNextActive();
-
-        self::assertTrue($result->successful());
-        $this->assertSubscriptions(
-            ['id' => 'poison', 'status' => 'ACTIVE', 'position' => 0, 'error' => null],
-            ['id' => 's1', 'status' => 'ACTIVE', 'position' => 1, 'error' => null],
-            ['id' => 'idle', 'status' => 'ACTIVE', 'position' => 1, 'error' => null],
-        );
-    }
-
-    public function test_bootNext_sets_failed_subscriptions_aside_and_does_not_report_them_as_pending(): void
+    public function test_bootNext_returns_a_failed_result_and_reports_the_subscription_as_pending(): void
     {
         $this->subscriptionStore->_setSubscriptions(self::subscriptionAt('poison', SubscriptionStatus::BOOTING, 0));
         $this->eventStore->append('event at #1');
@@ -2012,7 +1951,7 @@ final class SubscriptionEngineTest extends TestCase
         $result = $this->subscriptionEngine($this->poisonedSubscriber('poison'))->bootNext();
 
         self::assertFalse($result->successful());
-        self::assertFalse($result->hasPendingEvents);
+        self::assertTrue($result->hasPendingEvents);
         $this->assertSubscriptions(['id' => 'poison', 'status' => 'BOOTING', 'position' => 0, 'error' => null]);
     }
 
