@@ -1,7 +1,7 @@
 {
     "name": "wwwision/subscription-engine",
     "description": "Subscription engine for event-sourced systems",
-    "type": "package",
+    "type": "library",
     "license": "MIT",
     "authors": [
         {
