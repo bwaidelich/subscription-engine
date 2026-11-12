@@ -1,156 +1,336 @@
-# Subscription engine for Event Stores
+# Subscription Engine
 
-Subscription engine for event-sourced systems
+[![Latest version](https://img.shields.io/packagist/v/wwwision/subscription-engine)](https://packagist.org/packages/wwwision/subscription-engine)
+[![PHP version](https://img.shields.io/packagist/dependency-v/wwwision/subscription-engine/php)](./composer.json)
+[![License](https://img.shields.io/packagist/l/wwwision/subscription-engine)](./LICENSE)
 
-## Usage
+**Keep the projections and event handlers of your event-sourced PHP application up to date.**
 
-This package contains base types and interfaces for Subscription Engines.
-In order to use it, implementations for the following interfaces have to be provided:
+The engine passes new events from your event store to your subscribers and remembers how far each of them got. That makes it possible to add a subscriber at any time, rebuild a projection from the first event, and fix a failing subscriber without affecting the others.
 
-### `SubscriptionStore`
+```mermaid
+flowchart LR
+    events[(Event store)] -- new events --> engine[Subscription engine]
+    engine -- handle event --> projection[Projections]
+    engine -- handle event --> process[Event handlers]
+    engine <-- status and position --> store[(Subscription store)]
+```
 
-The [SubscriptionStore](./src/Store/SubscriptionStore.php) allows to persist and update the state of subscriptions and allows to lock access such that multiple processes cannot change the same subscription at the same time.
+- **Works with your stack:** Adapters for different event stores and databases, or write your own
+- **Rebuild at any time:** Replay all events into a projection after fixing a bug or changing its schema
+- **Isolated failures:** A failing subscriber stops, while the others continue
+- **Exactly once:** A projection that uses the connection of the subscription store is saved together with its progress
+- **Ready to scale:** Process large backlogs in batches and run workers in parallel (2.0)
 
-#### Implementations
+> [!NOTE]
+> This documentation describes the upcoming version 2.0. Features that aren't part of the latest release are marked with **(2.0)**, see [how to try them](#try-the-upcoming-version).
 
-- [wwwision/subscription-engine-doctrine](https://packagist.org/packages/wwwision/subscription-engine-doctrine) provides a DBAL implementation that is compatible with MySQL/MariaDB, PostgreSQL and SQLite.
-- [ekvedaras/subscription-engine-illuminate](https://packagist.org/packages/ekvedaras/subscription-engine-illuminate) provides an implementation that uses [Laravel database](https://laravel.com/docs/12.x/database).
+## Quick start
 
-### `EventStoreAdapter`
+This example uses a SQLite database and needs PHP 8.3+ with `pdo_sqlite`. Install the engine, a subscription store, an event store and the matching adapter:
 
-The [EventStoreAdapter](./src/EventStore/EventStoreAdapter.php) is the adapter for the actual event store implementation
+```bash
+composer require wwwision/subscription-engine wwwision/subscription-engine-doctrine wwwision/subscription-engine-dcb-adapter wwwision/dcb-eventstore-doctrine
+```
 
-#### Implementations
+Save this as `quickstart.php`:
 
-- [wwwision/subscription-engine-neos-adapter](https://packagist.org/packages/wwwision/subscription-engine-neos-adapter) - adapter for the [neos/eventstore](https://packagist.org/packages/neos/eventstore)
-- [wwwision/subscription-engine-dcb-adapter](https://packagist.org/packages/wwwision/subscription-engine-dcb-adapter) - adapter for the [wwwision/dcb-eventstore](https://packagist.org/packages/wwwision/dcb-eventstore)
+```php
+<?php
 
-## Bounded catch-ups
+declare(strict_types=1);
 
-By default, `SubscriptionEngine::catchUpActive()` and `SubscriptionEngine::boot()` read to the end of the event log in a single transaction and hold the lock on all matching subscriptions until they are done.
-With the `limit` parameter a call reads at most that number of events, persists the positions, commits and returns:
+use Doctrine\DBAL\DriverManager;
+use Doctrine\DBAL\Tools\DsnParser;
+use Wwwision\DCBEventStore\Event\Event;
+use Wwwision\DCBEventStore\Event\Events;
+use Wwwision\DCBEventStore\SequencedEvent\SequencedEvent;
+use Wwwision\DCBEventStoreDoctrine\DoctrineEventStore;
+use Wwwision\SubscriptionEngine\Subscriber\Subscriber;
+use Wwwision\SubscriptionEngine\Subscriber\Subscribers;
+use Wwwision\SubscriptionEngine\SubscriptionEngine;
+use Wwwision\SubscriptionEngineDcbAdapter\DcbEventStoreAdapter;
+use Wwwision\SubscriptionEngineDoctrine\DoctrineSubscriptionStore;
+
+require __DIR__ . '/vendor/autoload.php';
+
+$connection = DriverManager::getConnection((new DsnParser())->parse('pdo-sqlite:///' . __DIR__ . '/demo.sqlite'));
+$eventStore = DoctrineEventStore::create($connection, eventTableName: 'events');
+
+$engine = new SubscriptionEngine(
+    eventStoreAdapter: new DcbEventStoreAdapter($eventStore),
+    subscriptionStore: new DoctrineSubscriptionStore($connection, tableName: 'subscriptions'),
+    subscribers: Subscribers::fromArray([
+        Subscriber::create(
+            id: 'activity-log',
+            handler: fn (SequencedEvent $event) => $connection->insert('activity_log', [
+                'position' => $event->position->value,
+                'type' => $event->event->type->value,
+            ]),
+            setup: fn () => $connection->executeStatement('CREATE TABLE IF NOT EXISTS activity_log (position INTEGER PRIMARY KEY, type TEXT NOT NULL)'),
+            reset: fn () => $connection->executeStatement('DELETE FROM activity_log'),
+        ),
+    ]),
+);
+
+// 1. Once per deployment: Create the tables, register the subscribers and process past events
+$eventStore->setup();
+$engine->setup();
+$engine->boot();
+
+// 2. Store some events
+$eventStore->append(Events::fromArray([
+    Event::create('ProductAdded', '{"id": "p1"}'),
+    Event::create('ProductRenamed', '{"id": "p1", "name": "New name"}'),
+]));
+
+// 3. Pass the new events to the subscribers
+$engine->catchUpActive();
+
+foreach ($connection->fetchAllAssociative('SELECT * FROM activity_log') as $row) {
+    echo "{$row['position']}: {$row['type']}\n";
+}
+```
+
+Then run it:
+
+```console
+$ php quickstart.php
+1: ProductAdded
+2: ProductRenamed
+```
+
+## Which packages do I need?
+
+The engine itself contains no database code. Choose one event store adapter and one subscription store:
+
+| You need | Package | For |
+|---|---|---|
+| **An event store adapter** | [wwwision/subscription-engine-dcb-adapter](https://github.com/bwaidelich/subscription-engine-dcb-adapter) | [wwwision/dcb-eventstore](https://github.com/bwaidelich/dcb-eventstore) |
+| | [wwwision/subscription-engine-neos-adapter](https://github.com/bwaidelich/subscription-engine-neos-adapter) | [neos/eventstore](https://github.com/neos/eventstore) |
+| **A subscription store** | [wwwision/subscription-engine-doctrine](https://github.com/bwaidelich/subscription-engine-doctrine) | MySQL, MariaDB, PostgreSQL and SQLite with Doctrine DBAL |
+| | [ekvedaras/subscription-engine-illuminate](https://packagist.org/packages/ekvedaras/subscription-engine-illuminate) | [Laravel database](https://laravel.com/docs/12.x/database) |
+| **Background processing** (optional) | [wwwision/subscription-engine-worker](https://github.com/bwaidelich/subscription-engine-worker) (2.0) | A long-running process with Supervisor and Kubernetes examples |
+
+Nothing suitable? See [Writing your own store or adapter](./docs/how-it-works.md#writing-your-own-store-or-adapter).
+
+## Guides
+
+The handlers in these guides receive a `SequencedEvent`, as in the quick start. The event type depends on [your adapter](#which-packages-do-i-need).
+
+- [Add a projection](#add-a-projection)
+- [React to new events only](#react-to-new-events-only)
+- [Deploy](#deploy)
+- [Process new events](#process-new-events)
+- [Rebuild a projection](#rebuild-a-projection)
+- [Handle failures](#handle-failures)
+- [See what is going on](#see-what-is-going-on)
+- [Process a large backlog in batches](#process-a-large-backlog-in-batches-20) (2.0)
+- [Run several workers in parallel](#run-several-workers-in-parallel-20) (2.0)
+
+### Add a projection
+
+A projection builds a table, or anything else you can query, from all events. Only `id` and `handler` are required:
+
+```php
+Subscriber::create(
+    id: 'product-list',
+    handler: function (SequencedEvent $event) use ($connection): void {
+        // update the table for this event
+    },
+    setup: fn () => $connection->executeStatement('CREATE TABLE IF NOT EXISTS product_list (...)'),
+    reset: fn () => $connection->executeStatement('DELETE FROM product_list'),
+);
+```
+
+- `setup` prepares what the subscriber needs. It runs with every `$engine->setup()` call, so it has to be repeatable
+- `reset` removes the data, so that the projection can be rebuilt
+
+> [!IMPORTANT]
+> Use the same database connection as the subscription store for everything a projection writes. Its changes are then saved together with the progress of the subscription, so that each event counts exactly once. With anything else, an event can be handled more than once.
+
+### React to new events only
+
+Some handlers must not run for events from the past, for example one that sends an email. Set their run mode to `FROM_NOW`, so that they start with the next new event:
+
+```php
+use Wwwision\SubscriptionEngine\Subscription\RunMode;
+
+Subscriber::create(
+    id: 'order-confirmation',
+    handler: fn (SequencedEvent $event) => $mailer->sendOrderConfirmation($event),
+    runMode: RunMode::FROM_NOW,
+);
+```
+
+### Deploy
+
+Run this once per deployment, not in every process:
+
+```php
+$engine->setup(); // creates the tables and registers new subscribers
+$engine->boot();  // passes past events to the subscribers that are new or were reset
+```
+
+Existing subscribers aren't affected. A new `FROM_BEGINNING` subscriber, the default, receives all past events during `boot()`. After that, it counts as active and receives new events.
+
+### Process new events
+
+To update your projections directly after storing an event, call `catchUpActive()` in the same process. When it returns, the events have been handled:
+
+```php
+$eventStore->append($events);
+$engine->catchUpActive();
+```
+
+To keep requests fast, leave this to a process that runs in the background instead, for example [wwwision/subscription-engine-worker](https://github.com/bwaidelich/subscription-engine-worker) (2.0).
+
+### Rebuild a projection
+
+For example after fixing a bug or changing the structure of a table. This calls the `reset` function of the subscriber and starts over with the first event:
+
+```php
+use Wwwision\SubscriptionEngine\Engine\SubscriptionEngineCriteria;
+
+$criteria = SubscriptionEngineCriteria::create(['product-list']);
+$engine->reset($criteria);
+$engine->boot($criteria);
+```
+
+> [!WARNING]
+> `reset()` affects **all** subscribers if you don't pass any criteria, and `boot()` passes all past events to them, including the `FROM_NOW` ones: A subscriber that sends emails would send them again. To skip the past events after resetting a `FROM_NOW` subscriber, call `$engine->setup($criteria)` instead of `boot()`.
+
+If you run a worker, or anything else that keeps processing, stop it first when using version 1.x. As of version 2.0 it can [keep running](./docs/how-it-works.md#reset-and-setup-with-running-workers).
+
+### Handle failures
+
+If a handler throws an exception, its subscription stops with the status `ERROR`, and the other subscribers continue. The engine doesn't throw in this case, so check the result:
+
+```php
+$result = $engine->catchUpActive();
+
+if (!$result->successful()) {
+    foreach ($result->errors as $error) {
+        printf("%s failed at event %d: %s\n", $error->subscriptionId->value, $error->position?->value, $error->message);
+    }
+}
+```
+
+The handler may have applied the event partially, so the engine doesn't retry it. Fix the cause and [rebuild the projection](#rebuild-a-projection).
+
+Database errors, such as a deadlock, can behave differently and are repeated automatically. See [Exceptions during a catch-up](./docs/how-it-works.md#exceptions-during-a-catch-up).
+
+### See what is going on
+
+Get the current state of all subscriptions, for example for a status command:
+
+```php
+foreach ($engine->getSubscriptions() as $subscription) {
+    printf("%s: %s at position %d\n", $subscription->id->value, $subscription->status->value, $subscription->position->value);
+}
+```
+
+```console
+product-list: ACTIVE at position 42
+order-confirmation: ERROR at position 17
+```
+
+The engine also reports what it does through engine events. Their log level allows you to filter them:
+
+```php
+use Wwwision\SubscriptionEngine\Engine\EngineEvent\EngineEvent;
+
+$engine->onEngineEvent(function (EngineEvent $event): void {
+    if ($event->logLevel() <= LOG_WARNING) {
+        error_log((string) $event);
+    }
+});
+```
+
+### Process a large backlog in batches (2.0)
+
+By default, a catch-up reads to the end of the event log in a single transaction. With `limit`, it stops after that number of events and saves its progress, so that the transactions stay small:
 
 ```php
 do {
-    $result = $subscriptionEngine->catchUpActive($criteria, limit: 500);
+    $result = $engine->catchUpActive(limit: 500);
     if (!$result->successful()) {
         // handle $result->errors
     }
 } while ($result->hasPendingEvents);
 ```
 
-The lock is released between two calls, so other workers can take their turn.
+`boot()` supports `limit` as well. [Details](./docs/how-it-works.md#bounded-catch-ups)
 
-- `hasPendingEvents` means that calling the method again with the same arguments could process more events. It is `false` if all subscriptions of the run failed, even if the event log contains more events
-- A subscription that is booted partially stays `BOOTING` until no events are pending
-- `limit` counts the events that are read, including events that are skipped by subscriptions that are already ahead. The number of handler invocations can be higher: With 10 subscriptions, `limit: 500` can lead to 5,000 invocations
-- A run reads from the lowest position of its subscriptions, so subscriptions that are ahead receive no new events until the one lagging behind has caught up. To prevent that, catch up independently lagging subscriptions separately via `SubscriptionEngineCriteria`
+### Run several workers in parallel (2.0)
 
-See [docs/decisions.md](./docs/decisions.md) for the reasoning.
+[wwwision/subscription-engine-worker](https://github.com/bwaidelich/subscription-engine-worker) does this for you: Start the same script as often as you like. It also takes care of stop signals, retries and restarts.
 
-## Concurrent workers
-
-`SubscriptionEngine::catchUpNextActive()` and `SubscriptionEngine::bootNext()` allow several workers to process the same set of subscriptions in parallel, without advisory locks or partition assignment.
-Each call claims one subscription, the one with the lowest position that is not locked by another worker, and catches it up in its own transaction:
+To write your own loop, use `catchUpNextActive()` and `bootNext()`. Each call picks one subscription that no other worker is busy with:
 
 ```php
 while (true) {
-    $result = $subscriptionEngine->catchUpNextActive($criteria, limit: 500);
+    $result = $engine->catchUpNextActive(limit: 500);
     if (!$result->successful()) {
-        // handle $result->errors
+        // handle $result->errors: The next call claims the failed subscription again,
+        // leave it out through SubscriptionEngineCriteria for a while so that the others can continue
     }
     if (!$result->hasPendingEvents) {
-        // nothing to do, or everything is locked by other workers ($result->allSubscriptionsLocked)
-        usleep(100_000);
+        usleep(100_000); // nothing to do, or everything is locked by other workers
     }
 }
 ```
 
-- `catchUpActive()` and `boot()` keep waiting for locks and remain the choice if the caller relies on its events being processed once the call returns. Both kinds of workers can be mixed
-- `hasPendingEvents` means that calling the method again with the same arguments could process more events, for any matching subscription. Keep polling instead of exiting: In rare cases it is `false` while a subscription lags, and a worker holding a lock could get killed
-- A booting subscription is activated as soon as it has reached the end of the event log, independent of the others
-- Events of one subscription are always handled in order. There is no order *between* subscribers though: One can be ahead of another, so a handler must not rely on the projection of a different subscriber
-- N subscriptions take N reads of the event log, instead of one that they share
-
-### Failing runs
-
-If a run fails after the claim, for example because of a deadlock or a repeating SQL error on PostgreSQL, it is rolled back and the method returns a failed result instead of throwing, unlike `catchUpActive()` and `boot()`. The subscription keeps its status.
-The engine instance leaves it out of its next claims, so it can't starve the others, and retries it as soon as they have nothing left to do. A temporary error recovers by itself.
-
 > [!WARNING]
-> This state is kept per engine instance. A process that makes a single call and exits runs into a failing subscription every time and starves the others, so workers have to loop within the process. Always check `successful()`, a repeating failure is otherwise only visible through the `SubscriberFailedToHandleEvent` and `CatchUpRunFailed` engine events.
+> Leave failed subscriptions out, and don't assume any order between subscribers: One can be ahead of another. [Details](./docs/how-it-works.md#concurrent-workers)
 
-### `reset()` and `setup()` with running workers
+## Cheat sheet
 
-Workers don't have to be stopped. `reset()` waits for running catch-ups and sets the status `RESETTING`, which no catch-up matches, for all matching subscriptions. The reset functions then run without a lock, so they can use DDL like `TRUNCATE`, and each subscription goes to `BOOTING` at position 0 afterwards.
+### Methods
 
-- If a reset function fails, the subscription goes to `ERROR` and no worker continues on the partially cleared projection. Call `reset()` again to retry
-- If a subscription is already `RESETTING`, another reset is running or has crashed. `reset()` skips it and reports an error. Once you know that the other process is gone, take over with `reset($criteria, force: true)`. This runs the reset function again
-- `reset()` throws if it can't get the locks in time or runs into a deadlock with a blocking worker, which is possible on MySQL and MariaDB. Nothing has changed in that case and the call can be repeated
+All methods accept an optional `SubscriptionEngineCriteria` to restrict them to certain subscribers.
 
-`setup()` does not stop workers: Its functions run while events are being handled, so they have to stay compatible with the running code. Stop the workers for a setup that needs exclusive access.
+| Method | What it does |
+|---|---|
+| `setup()` | Creates the subscription table, registers new subscribers and calls their `setup` function |
+| `boot()` | Passes past events to subscribers in the status `BOOTING` and activates them |
+| `catchUpActive()` | Passes new events to subscribers in the status `ACTIVE` |
+| `reset()` | Calls the `reset` function and moves subscribers back to the first event, in the status `BOOTING` |
+| `getSubscriptions()` | Returns the state of the subscriptions. `getSubscription($id)` returns a single one |
+| `bootNext()`, `catchUpNextActive()` | Like `boot()` and `catchUpActive()`, for a single free subscription (2.0) |
 
-See [docs/decisions.md](./docs/decisions.md) for the reasoning.
+### Statuses
 
-## Exceptions during a catch-up
+| Status | Meaning | What to do |
+|---|---|---|
+| `NEW` | Discovered, but not set up | Call `setup()` |
+| `BOOTING` | Set up or reset, past events are pending | Call `boot()` |
+| `ACTIVE` | Receives new events | Nothing |
+| `ERROR` | A subscriber failed | Fix the cause, then call `reset()` and `boot()` |
+| `RESETTING` (2.0) | The `reset` function is running, or has crashed | Wait. [If it has crashed](./docs/how-it-works.md#reset-and-setup-with-running-workers), call `reset($criteria, force: true)` |
+| `DETACHED` | The subscriber doesn't exist anymore | Nothing if you removed it. Otherwise call `reset()` and `boot()` |
 
-An exception that escapes a catch-up, for example a deadlock, rolls back the current run and is rethrown.
-Positions and everything else that is part of the transaction stay at the last committed batch, so the catch-up can be repeated with the same engine instance.
+## Try the upcoming version
 
-> [!NOTE]
-> A database error inside a subscriber is usually not an escaping exception: The subscription goes to `ERROR` and the run continues without it.
-> If the error has ended the transaction, which MySQL and MariaDB do for a deadlock victim and PostgreSQL for every SQL error, the store fails on its next write. That exception escapes, so no subscription goes to `ERROR` and the batch is repeated on the next catch-up. An error that keeps occurring on PostgreSQL therefore blocks all subscriptions of the run. Run them separately via `SubscriptionEngineCriteria` to isolate it.
+Version 2.0 isn't released yet, and its APIs can still change. To try it, allow development versions in your `composer.json`:
 
-### Stores on MySQL and MariaDB
-
-With the default isolation level (`REPEATABLE READ`), workers that wait for a subscription lock can deadlock with a worker that changes the status of a subscription.
-`SubscriptionStore` implementations should use `READ COMMITTED` for their transactions on these databases, as [wwwision/subscription-engine-doctrine](https://packagist.org/packages/wwwision/subscription-engine-doctrine) does.
-
-## Upgrading to 2.0
-
-Implementations of the following interfaces have to be adjusted, otherwise PHP fails with a fatal error.
-Implementations with these changes are also compatible with 1.x.
-
-`EventStoreAdapter::read()` has a new parameter:
-
-```php
-public function read(Position $startPosition, int|null $limit = null): iterable;
+```bash
+composer config minimum-stability dev
+composer config prefer-stable true
+composer require wwwision/subscription-engine:2.x-dev wwwision/subscription-engine-doctrine:dev-main wwwision/subscription-engine-dcb-adapter:dev-main
 ```
 
-Implementations must return at most `$limit` events, and all events if it is `null`.
+With `neos/eventstore`, use `wwwision/subscription-engine-neos-adapter:dev-main` instead of the DCB adapter. Coming from 1.x? See the [upgrade guide](./docs/upgrading.md).
 
-`SubscriptionStore` has a new method:
+## Learn more
 
-```php
-public function rollback(): void;
-```
-
-It discards all changes since the last `beginTransaction()`. Afterwards the store must be usable for a new transaction.
-
-`SubscriptionStore::add()` and `update()` must throw an exception if the database has ended the transaction on its own, for example after a deadlock. Note that `PDO::inTransaction()` still reports `true` on MySQL and MariaDB until the next successful statement.
-
-`SubscriptionStore` also has a new method for [concurrent workers](#concurrent-workers):
-
-```php
-public function claimNext(SubscriptionCriteria $criteria): Subscription|null;
-```
-
-It locks and returns the matching subscription with the lowest position that is not locked by another process, with ties broken by id, without waiting for locks. It must not lock any other subscription, and has to return the state at the time of the lock.
-
-`SubscriptionStatus` has the new case `RESETTING`, code with an exhaustive `match` has to handle it. A failing reset function now moves the subscription to `ERROR`, it used to keep its status.
-
-> [!WARNING]
-> Up to 1.x workers keep running during `setup()` and `reset()`, which can handle events twice or write back an old position. On 1.x stop all workers for both. If workers were running during one of those calls, `reset()` and replay the affected subscriptions.
-
-> [!WARNING]
-> Up to 1.x a deadlock inside a subscriber handler on MySQL or MariaDB could persist positions without the events they stand for, for all subscriptions of that run. This can't be detected afterwards. If such deadlocks occurred, `reset()` and replay the affected subscriptions.
-
-> [!NOTE]
-> The signature of this method might still change until 2.0 is released.
+- [How it works](./docs/how-it-works.md): Statuses, guarantees, concurrency, failures and how to write your own store or adapter
+- [Upgrading to 2.0](./docs/upgrading.md): Required changes, and known problems of 1.x
+- [Decisions](./docs/decisions.md): The reasoning behind the design
 
 ## Contribution
 
-Contributions in the form of [issues](https://github.com/bwaidelich/subscription-engine/issues) or [pull requests](https://github.com/bwaidelich/subscription-engine/pulls) are highly appreciated
+Contributions in the form of [issues](https://github.com/bwaidelich/subscription-engine/issues) or [pull requests](https://github.com/bwaidelich/subscription-engine/pulls) are highly appreciated. Run the checks with `composer test`.
 
 ## License
 
