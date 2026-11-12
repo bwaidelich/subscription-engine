@@ -37,6 +37,7 @@ use Wwwision\SubscriptionEngine\Engine\ProcessedResult;
 use Wwwision\SubscriptionEngine\Engine\Result;
 use Wwwision\SubscriptionEngine\Engine\SubscriptionEngineCriteria;
 use Wwwision\SubscriptionEngine\EventStore\EventStoreAdapter;
+use Wwwision\SubscriptionEngine\EventStore\ReadOptions;
 use Wwwision\SubscriptionEngine\Store\SubscriptionCriteria;
 use Wwwision\SubscriptionEngine\Store\SubscriptionStore;
 use Wwwision\SubscriptionEngine\Subscriber\Subscribers;
@@ -54,6 +55,7 @@ use Wwwision\SubscriptionEngine\Subscription\SubscriptionStatusFilter;
  * This implementation is heavily inspired and adjusted from the event-sourcing package of "patchlevel": {@link https://github.com/patchlevel/event-sourcing/}
  *
  * @template E of object
+ * @template F of object = object
  */
 final class SubscriptionEngine
 {
@@ -65,7 +67,7 @@ final class SubscriptionEngine
     private SubscriptionIds $processingSubscriptions;
 
     /**
-     * @param EventStoreAdapter<E> $eventStoreAdapter
+     * @param EventStoreAdapter<E, F> $eventStoreAdapter
      */
     public function __construct(
         private readonly EventStoreAdapter $eventStoreAdapter,
@@ -447,10 +449,10 @@ final class SubscriptionEngine
             }
             $this->processingSubscriptions = $this->processingSubscriptions->merge(SubscriptionIds::fromArray([$claimed->id]));
             $claimedSubscriptions = Subscriptions::fromArray([$claimed]);
-            [$numberOfProcessedEvents, $errors] = $this->handleEvents($claimedSubscriptions, $limit);
+            [$numberOfProcessedEvents, $errors, , $hadNothingToRead] = $this->handleEvents($claimedSubscriptions, $limit);
             $this->subscriptionStore->commit();
             $committed = true;
-            if ($status === SubscriptionStatus::ACTIVE && $numberOfProcessedEvents === 0) {
+            if ($status === SubscriptionStatus::ACTIVE && $hadNothingToRead) {
                 // the claimed subscription had the lowest position, so all others that are not locked are at the end of the event log, too
                 $hasPendingEvents = false;
             } else {
@@ -539,7 +541,10 @@ final class SubscriptionEngine
     /**
      * Passes the events to the given subscriptions and persists their new state, without ending the transaction
      *
-     * @return array{int, array<Error>, bool} number of processed events, errors and whether the limit prevented reading more events for the remaining subscriptions
+     * A single subscription with a filter passes it to the adapter. As the end of such a read can't be seen from the returned events, it is bounded by a snapshot of the last position.
+     * Several subscriptions share one unfiltered read, and the engine applies their filters. Events that a filter excludes advance the position like handled ones
+     *
+     * @return array{int, array<Error>, bool, bool} number of processed events, errors, whether the limit prevented reading more events for the remaining subscriptions and whether there was nothing to read at all
      */
     private function handleEvents(Subscriptions $subscriptionsToCatchup, int|null $limit): array
     {
@@ -553,7 +558,21 @@ final class SubscriptionEngine
         $highestPositionForSubscriber = [];
 
         $hasPendingEvents = false;
-        foreach ($this->eventStoreAdapter->read($startPosition, $limit !== null ? $limit + 1 : null) as $event) {
+        $readLimit = $limit !== null ? $limit + 1 : null;
+        $pushedDownFilter = null;
+        if ($subscriptionsToCatchup->count() === 1) {
+            foreach ($subscriptionsToCatchup as $subscription) {
+                $pushedDownFilter = $this->subscribers->get($subscription->id)->filter;
+            }
+        }
+        $upTo = null;
+        if ($pushedDownFilter !== null) {
+            $upTo = $this->eventStoreAdapter->lastPosition();
+            $events = $startPosition->isAheadOf($upTo) ? [] : $this->eventStoreAdapter->read($startPosition, ReadOptions::create(limit: $readLimit, upTo: $upTo, filter: $pushedDownFilter));
+        } else {
+            $events = $this->eventStoreAdapter->read($startPosition, ReadOptions::create(limit: $readLimit));
+        }
+        foreach ($events as $event) {
             if ($numberOfProcessedEvents === $limit) {
                 $hasPendingEvents = true;
                 break;
@@ -564,6 +583,14 @@ final class SubscriptionEngine
                 if (!$eventPosition->isAheadOf($subscription->position)) {
                     $this->dispatchEngineEvent(new SubscriberSkippedEvent($subscription, $event, $eventPosition));
                     continue;
+                }
+                if ($pushedDownFilter === null && $subscriber->filter !== null) {
+                    /** @var F $filter */
+                    $filter = $subscriber->filter;
+                    if (!$this->eventStoreAdapter->matches($filter, $event)) {
+                        $highestPositionForSubscriber[$subscription->id->value] = $eventPosition;
+                        continue;
+                    }
                 }
                 try {
                     ($subscriber->handler)($event);
@@ -590,6 +617,10 @@ final class SubscriptionEngine
         foreach ($subscriptionsToCatchup as $subscription) {
             // The position will be set to the one the subscriber handled last, or if no events were in the stream, and we booted we keep the persisted position
             $position = $highestPositionForSubscriber[$subscription->id->value] ?? $subscription->position;
+            if (!$hasPendingEvents && $upTo !== null && $upTo->isAheadOf($position)) {
+                // a filtered read that reached its end has seen every event up to the snapshot, even if none of them matched
+                $position = $upTo;
+            }
             if ($hasPendingEvents) {
                 // a partial catch-up keeps the status: Booting subscriptions must not be triggered automatically until they reached the end of the event log
                 $this->subscriptionStore->update($subscription->with(position: $position));
@@ -601,7 +632,8 @@ final class SubscriptionEngine
                 $this->dispatchEngineEvent(new SubscriptionActivated($subscription, $subscription->status));
             }
         }
-        return [$numberOfProcessedEvents, $errors, $hasPendingEvents];
+        $hadNothingToRead = $upTo !== null ? $startPosition->isAheadOf($upTo) : $numberOfProcessedEvents === 0;
+        return [$numberOfProcessedEvents, $errors, $hasPendingEvents, $hadNothingToRead];
     }
 
     /**

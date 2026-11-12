@@ -32,11 +32,7 @@ With a large backlog that means one huge transaction and a long-held lock, which
 
 ### Open points
 
-For the `read()` filter/query follow-up:
-
-- `limit` would count matching events only, so it no longer bounds how much the store scans.
-- Positions advance only to the last handled event. A filtered subscription could stay far behind the log and rescan the same gap on every run, and a partial run could make no visible progress.
-- `limit + 1` still works, but "pending" would mean more *matching* events.
+For the `read()` filter/query follow-up: Settled in [Filtered reads](#filtered-reads-target-20).
 
 For concurrent subscriptions:
 
@@ -139,7 +135,7 @@ Several workers should be able to call the engine on the same set of subscriptio
 - Escalation of repeating failures, for example a `critical` log after N failed runs: In the worker, it needs no core change. Postponed until real failure patterns are known.
 - `SubscriptionEngineCriteria` that excludes ids and ignores those without a subscriber. Today callers leave subscriptions out with an include list, which fails once a subscriber is removed. Additive.
 - A persisted failure counter that moves a subscription to `ERROR` after N failed runs, together with a `retry()` that keeps the position. It requires a new column and a new field on `Subscription`. Additive.
-- The `read()` filter/query follow-up: With filtered subscriptions, a position can stay behind `lastPosition()` although no matching event is left, so `hasPendingEvents` would stay `true`.
+- The `read()` filter/query follow-up: Settled in [Filtered reads](#filtered-reads-target-20).
 
 ## The reset() race (target: 2.0)
 
@@ -180,3 +176,35 @@ Holding a transaction during the handler is no option. `TRUNCATE` and DDL commit
 - **Handlers of one call run in sequence.** All subscriptions of the call stay fenced until their handler is done.
 - **Setup handlers run while workers are active.** A handler that needs exclusive access requires stopped workers.
 - **Concurrent discovery can fail.** Two simultaneous `setup()` calls can both `add()` the same new subscription, the second one fails with a duplicate key. That is loud, a retry fixes it and no data is damaged. A fix requires an upsert in the store contract.
+
+## Filtered reads (target: 2.0)
+
+### Context
+
+Subscribers often care about a small part of the event log, but every run reads and passes all events. The event stores can filter (DCB by event types and tags, Neos by stream and event types), the adapter contract couldn't express it.
+
+A parameter added to `EventStoreAdapter::read()` after 2.0 would break every adapter, so the signature has to be final before 2.0 is tagged.
+
+### Decisions
+
+| # | Topic | Decision | Why |
+|---|-------|----------|-----|
+| 1 | Source of the filter | Declared per subscriber: `Subscriber::create(..., filter: ...)`. Not persisted. Changing it for an existing subscription requires a new id or `reset()` | A per call filter would let positions skip events that another call expects. Persisting a fingerprint would need a schema change and a serializable filter |
+| 2 | Filter type | Opaque and adapter specific: `EventStoreAdapter` is `@template F of object = object`, the filter is `object\|null` in core | Stores differ too much: Neos streams, DCB tags. A core value object would fit none of them well. As `Subscriber` isn't generic, PHPStan can't link a filter to its adapter, a wrong type surfaces as exception of the adapter |
+| 3 | Signature | Breaking: `read(Position $startPosition, ReadOptions $options): iterable` with `ReadOptions::create(limit, upTo, filter)`. `upTo` is inclusive. A `limit` below 1 and `upTo: Position::none()` throw | New options don't change the signature. `upTo: none()` would read nothing, the engine never needs it |
+| 4 | Runs with one subscription | The filter is passed to `read()`, bounded by `upTo`, a snapshot of `lastPosition()` taken before the read. A read that is exhausted moves the subscription to `upTo`. If the start is beyond `upTo`, nothing is read | A filtered read doesn't show how far it scanned. Without the snapshot, a subscription without matching events would stay behind, rescan the gap on every run, and count as pending forever. A scanned-up-to position reported by the adapter would need a heavier return type and an extra query in both stores |
+| 5 | Runs with several subscriptions | One unfiltered read without `upTo`. The engine applies the filters with the new required `EventStoreAdapter::matches(F $filter, E $event): bool` | Keeps the one shared read and the order of events across subscribers. No merging of filters, which Neos can't do for several streams, and no equality on opaque filters. Passing a filter that all subscriptions share to the adapter is an internal optimization that can be added later |
+| 6 | Events a filter excludes | Advance the position like handled events, without engine event | A partial run makes visible progress and doesn't rescan. `SubscriberSkippedEvent` means "already ahead", a new event would be noise and can be added later |
+| 7 | What `limit` counts | Events returned by `read()`: Matching events with one filtered subscription, all events otherwise | The adapter can't report how many events it scanned. `upTo` bounds the scan |
+| 8 | Adapters | `read()` returns exactly the matching events. No engine fallback. Each adapter only accepts filters it can apply, in SQL or PHP | Silent fallbacks were rejected elsewhere in this project |
+| 9 | `hasPendingEvents` shortcut | The shortcut of [Skip-locked catch-ups](#skip-locked-catch-ups-target-20) decision 9 only applies if there was nothing to read: No event for an unfiltered read, a start beyond `upTo` for a filtered one | A filtered subscription can read no event while it scanned a gap, so it's no proof that the others are at the end |
+| 10 | Snapshot only when needed | `lastPosition()` is only called before filtered reads. `hasPendingEvents` keeps calling it after the run instead of reusing the snapshot | An unfiltered read shows how far it got. Reusing the snapshot would save one cheap query, but report events appended during the run as not pending, which delays workers that wait for notifications |
+| 11 | Adapter filter types | DCB: `Query`. Neos: `NeosEventFilter` with a stream name and an optional `EventStreamFilter` | The native query types of the stores, Neos can only read one stream |
+
+### Known consequences
+
+- **No I/O savings for runs with several subscriptions.** `catchUpActive()` and `boot()` without criteria read all events. Filtered subscriptions save I/O in `catchUpNextActive()`, `bootNext()` and runs restricted to one subscription.
+- **A sparse filter can scan far.** `limit` counts matching events, so a run can scan up to the end of the event log before it finds enough.
+- **One more query per filtered run.** The snapshot of `lastPosition()`.
+- **Changing a filter is not detected.** Events that the old filter excluded are not handled. Use a new id or `reset()`.
+- **Events appended after the snapshot** are read by the next run. A subscription stays `BOOTING` until a run reaches the end.

@@ -20,17 +20,25 @@
 ## If you maintain a store or an adapter
 
 Implementations of the following interfaces have to be adjusted, otherwise PHP fails with a fatal error.
-Implementations with these changes are also compatible with 1.x.
+Implementations of `SubscriptionStore` with these changes are also compatible with 1.x, implementations of `EventStoreAdapter` are not.
 
 ### `EventStoreAdapter`
 
 `read()` has a new parameter:
 
 ```php
-public function read(Position $startPosition, int|null $limit = null): iterable;
+public function read(Position $startPosition, ReadOptions $options): iterable;
 ```
 
-Implementations must return at most `$limit` events, and all events if it is `null`.
+Implementations must honor all [`ReadOptions`](../src/EventStore/ReadOptions.php): Return at most `limit` events, none with a position above `upTo`, and only the ones that match `filter`. A `null` option means no constraint.
+
+A new method for [filtered subscribers](./how-it-works.md#filtered-subscribers):
+
+```php
+public function matches(object $filter, object $event): bool;
+```
+
+It has to decide the same way as `read()` with that filter. The second template parameter `F` of `EventStoreAdapter` defines which filters an adapter accepts, others should throw an `InvalidArgumentException`. An adapter without filter support can throw for every filter.
 
 ### `SubscriptionStore`
 

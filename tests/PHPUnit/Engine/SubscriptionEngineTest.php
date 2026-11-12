@@ -11,6 +11,7 @@ use Wwwision\SubscriptionEngine\Engine\EngineEvent\CatchUpFinished;
 use Wwwision\SubscriptionEngine\Engine\EngineEvent\EngineEvent;
 use Wwwision\SubscriptionEngine\Engine\EngineEvent\NoSubscriptionsFound;
 use Wwwision\SubscriptionEngine\Engine\EngineEvent\SubscriberHandledEvent;
+use Wwwision\SubscriptionEngine\Engine\EngineEvent\SubscriberSkippedEvent;
 use Wwwision\SubscriptionEngine\Engine\Exception\RecursiveCatchUpException;
 use Wwwision\SubscriptionEngine\Engine\Exception\UnknownSubscriptionIdsException;
 use Wwwision\SubscriptionEngine\Engine\SubscriptionEngineCriteria;
@@ -26,6 +27,7 @@ use Wwwision\SubscriptionEngine\SubscriptionEngine;
 use Wwwision\SubscriptionEngine\Tests\Mocks\InMemoryEventStoreAdapter;
 use Wwwision\SubscriptionEngine\Tests\Mocks\InMemorySubscriptionStore;
 use Wwwision\SubscriptionEngine\Tests\Mocks\MockEvent;
+use Wwwision\SubscriptionEngine\Tests\Mocks\MockFilter;
 
 #[CoversClass(SubscriptionEngine::class)]
 final class SubscriptionEngineTest extends TestCase
@@ -2006,6 +2008,207 @@ final class SubscriptionEngineTest extends TestCase
 
         $this->expectExceptionMessage('Update of s1 failed');
         $this->subscriptionEngine($this->poisonedSubscriber('s1'))->catchUpActive();
+    }
+
+    public function test_catchUpActive_passes_the_filter_of_a_single_subscription_to_the_adapter(): void
+    {
+        $this->eventStore->append('a');
+        $this->eventStore->append('b');
+        $this->eventStore->append('a');
+        $this->eventStore->append('b');
+        $this->subscriptionStore->_setSubscriptions(self::subscriptionAt('s1', SubscriptionStatus::ACTIVE, 0));
+        $handledEvents = [];
+        $filter = new MockFilter('a');
+
+        $result = $this->subscriptionEngine(Subscriber::create(SubscriptionId::fromString('s1'), static function (MockEvent $event) use (&$handledEvents) {
+            $handledEvents[] = $event->position->value;
+        }, filter: $filter))->catchUpActive();
+
+        self::assertSame($filter, $this->eventStore->_lastReadOptions()?->filter);
+        self::assertSame(4, $this->eventStore->_lastReadOptions()->upTo?->value);
+        self::assertSame([1, 3], $handledEvents);
+        self::assertSame(2, $result->numberOfProcessedEvents);
+        self::assertFalse($result->hasPendingEvents);
+        $this->assertSubscriptions(['id' => 's1', 'status' => 'ACTIVE', 'position' => 4, 'error' => null]);
+    }
+
+    public function test_catchUpActive_moves_a_filtered_subscription_to_the_end_of_the_event_log_without_matching_events(): void
+    {
+        $this->eventStore->append('b');
+        $this->eventStore->append('b');
+        $this->subscriptionStore->_setSubscriptions(self::subscriptionAt('s1', SubscriptionStatus::ACTIVE, 0));
+
+        $result = $this->subscriptionEngine(Subscriber::create(SubscriptionId::fromString('s1'), fn() => null, filter: new MockFilter('a')))->catchUpActive();
+
+        self::assertSame(0, $result->numberOfProcessedEvents);
+        $this->assertSubscriptions(['id' => 's1', 'status' => 'ACTIVE', 'position' => 2, 'error' => null]);
+    }
+
+    public function test_catchUpActive_with_limit_keeps_a_filtered_subscription_at_its_last_handled_event(): void
+    {
+        $this->eventStore->append('a');
+        $this->eventStore->append('b');
+        $this->eventStore->append('a');
+        $this->eventStore->append('b');
+        $this->subscriptionStore->_setSubscriptions(self::subscriptionAt('s1', SubscriptionStatus::ACTIVE, 0));
+
+        $result = $this->subscriptionEngine(Subscriber::create(SubscriptionId::fromString('s1'), fn() => null, filter: new MockFilter('a')))->catchUpActive(limit: 1);
+
+        self::assertSame(1, $result->numberOfProcessedEvents);
+        self::assertTrue($result->hasPendingEvents);
+        $this->assertSubscriptions(['id' => 's1', 'status' => 'ACTIVE', 'position' => 1, 'error' => null]);
+    }
+
+    public function test_catchUpActive_does_not_read_for_a_filtered_subscription_if_the_event_log_is_empty(): void
+    {
+        $this->subscriptionStore->_setSubscriptions(self::subscriptionAt('s1', SubscriptionStatus::BOOTING, 0));
+
+        $result = $this->subscriptionEngine(Subscriber::create(SubscriptionId::fromString('s1'), fn() => null, filter: new MockFilter('a')))->boot();
+
+        self::assertSame(0, $this->eventStore->_numberOfReads());
+        self::assertFalse($result->hasPendingEvents);
+        $this->assertSubscriptions(['id' => 's1', 'status' => 'ACTIVE', 'position' => 0, 'error' => null]);
+    }
+
+    public function test_catchUpActive_reads_unfiltered_and_without_upper_bound_for_an_unfiltered_subscription(): void
+    {
+        $this->eventStore->append('a');
+        $this->subscriptionStore->_setSubscriptions(self::subscriptionAt('s1', SubscriptionStatus::ACTIVE, 0));
+
+        $this->subscriptionEngine(Subscriber::create(SubscriptionId::fromString('s1'), fn() => null))->catchUpActive();
+
+        self::assertNull($this->eventStore->_lastReadOptions()?->filter);
+        self::assertNull($this->eventStore->_lastReadOptions()->upTo);
+    }
+
+    public function test_catchUpActive_reads_unfiltered_for_several_subscriptions_and_passes_only_matching_events(): void
+    {
+        $this->eventStore->append('a');
+        $this->eventStore->append('b');
+        $this->eventStore->append('c');
+        $this->subscriptionStore->_setSubscriptions(
+            self::subscriptionAt('s1', SubscriptionStatus::ACTIVE, 0),
+            self::subscriptionAt('s2', SubscriptionStatus::ACTIVE, 0),
+            self::subscriptionAt('s3', SubscriptionStatus::ACTIVE, 0),
+        );
+        $handledEvents = [];
+        $handler = static function (string $id) use (&$handledEvents) {
+            return static function (MockEvent $event) use (&$handledEvents, $id) {
+                $handledEvents[] = $id . ':' . $event->data;
+            };
+        };
+
+        $result = $this->subscriptionEngine(
+            Subscriber::create(SubscriptionId::fromString('s1'), $handler('s1'), filter: new MockFilter('a')),
+            Subscriber::create(SubscriptionId::fromString('s2'), $handler('s2'), filter: new MockFilter('b', 'c')),
+            Subscriber::create(SubscriptionId::fromString('s3'), $handler('s3')),
+        )->catchUpActive();
+
+        self::assertSame(1, $this->eventStore->_numberOfReads());
+        self::assertNull($this->eventStore->_lastReadOptions()?->filter);
+        self::assertNull($this->eventStore->_lastReadOptions()->upTo);
+        self::assertSame(['s1:a', 's3:a', 's2:b', 's3:b', 's2:c', 's3:c'], $handledEvents);
+        self::assertSame(3, $result->numberOfProcessedEvents);
+        $this->assertSubscriptions(
+            ['id' => 's1', 'status' => 'ACTIVE', 'position' => 3, 'error' => null],
+            ['id' => 's2', 'status' => 'ACTIVE', 'position' => 3, 'error' => null],
+            ['id' => 's3', 'status' => 'ACTIVE', 'position' => 3, 'error' => null],
+        );
+    }
+
+    public function test_catchUpActive_with_limit_advances_subscriptions_past_events_that_their_filter_excludes(): void
+    {
+        $this->eventStore->append('a');
+        $this->eventStore->append('b');
+        $this->eventStore->append('c');
+        $this->subscriptionStore->_setSubscriptions(
+            self::subscriptionAt('s1', SubscriptionStatus::ACTIVE, 0),
+            self::subscriptionAt('s2', SubscriptionStatus::ACTIVE, 0),
+        );
+
+        $result = $this->subscriptionEngine(
+            Subscriber::create(SubscriptionId::fromString('s1'), fn() => null, filter: new MockFilter('c')),
+            Subscriber::create(SubscriptionId::fromString('s2'), fn() => null),
+        )->catchUpActive(limit: 2);
+
+        self::assertTrue($result->hasPendingEvents);
+        $this->assertSubscriptions(
+            ['id' => 's1', 'status' => 'ACTIVE', 'position' => 2, 'error' => null],
+            ['id' => 's2', 'status' => 'ACTIVE', 'position' => 2, 'error' => null],
+        );
+    }
+
+    public function test_catchUpActive_does_not_emit_engine_events_for_events_that_a_filter_excludes(): void
+    {
+        $this->eventStore->append('a');
+        $this->subscriptionStore->_setSubscriptions(
+            self::subscriptionAt('s1', SubscriptionStatus::ACTIVE, 0),
+            self::subscriptionAt('s2', SubscriptionStatus::ACTIVE, 0),
+        );
+
+        $this->subscriptionEngine(
+            Subscriber::create(SubscriptionId::fromString('s1'), fn() => null, filter: new MockFilter('b')),
+            Subscriber::create(SubscriptionId::fromString('s2'), fn() => null),
+        )->catchUpActive();
+
+        self::assertSame(['s2'], array_values(array_map(
+            static fn(SubscriberHandledEvent $event) => $event->subscription->id->value,
+            array_filter($this->emittedEngineEvents, static fn(EngineEvent $event) => $event instanceof SubscriberHandledEvent),
+        )));
+        self::assertSame([], array_filter($this->emittedEngineEvents, static fn(EngineEvent $event) => $event instanceof SubscriberSkippedEvent));
+    }
+
+    public function test_catchUpNextActive_reports_pending_events_of_others_if_a_filtered_subscription_had_no_matching_events(): void
+    {
+        $this->eventStore->append('b');
+        $this->eventStore->append('b');
+        $this->subscriptionStore->_setSubscriptions(
+            self::subscriptionAt('s1', SubscriptionStatus::ACTIVE, 0),
+            self::subscriptionAt('s2', SubscriptionStatus::ACTIVE, 1),
+        );
+        $this->subscriptionStore->_lock('s2');
+
+        $result = $this->subscriptionEngine(
+            Subscriber::create(SubscriptionId::fromString('s1'), fn() => null, filter: new MockFilter('a')),
+            Subscriber::create(SubscriptionId::fromString('s2'), fn() => null),
+        )->catchUpNextActive();
+
+        self::assertSame(0, $result->numberOfProcessedEvents);
+        self::assertTrue($result->hasPendingEvents);
+        $this->assertSubscriptions(
+            ['id' => 's1', 'status' => 'ACTIVE', 'position' => 2, 'error' => null],
+            ['id' => 's2', 'status' => 'ACTIVE', 'position' => 1, 'error' => null],
+        );
+    }
+
+    public function test_catchUpNextActive_reports_no_pending_events_if_a_filtered_subscription_was_at_the_end_of_the_event_log(): void
+    {
+        $this->eventStore->append('b');
+        $this->subscriptionStore->_setSubscriptions(
+            self::subscriptionAt('s1', SubscriptionStatus::ACTIVE, 1),
+            self::subscriptionAt('s2', SubscriptionStatus::ACTIVE, 0),
+        );
+        $this->subscriptionStore->_lock('s2');
+
+        $result = $this->subscriptionEngine(
+            Subscriber::create(SubscriptionId::fromString('s1'), fn() => null, filter: new MockFilter('a')),
+            Subscriber::create(SubscriptionId::fromString('s2'), fn() => null),
+        )->catchUpNextActive();
+
+        self::assertSame(0, $this->eventStore->_numberOfReads());
+        self::assertFalse($result->hasPendingEvents);
+    }
+
+    public function test_bootNext_activates_a_filtered_subscription_once_it_scanned_to_the_end_of_the_event_log(): void
+    {
+        $this->eventStore->append('a');
+        $this->eventStore->append('b');
+        $this->subscriptionStore->_setSubscriptions(self::subscriptionAt('s1', SubscriptionStatus::BOOTING, 0));
+
+        $result = $this->subscriptionEngine(Subscriber::create(SubscriptionId::fromString('s1'), fn() => null, filter: new MockFilter('a')))->bootNext(limit: 1);
+
+        self::assertFalse($result->hasPendingEvents);
+        $this->assertSubscriptions(['id' => 's1', 'status' => 'ACTIVE', 'position' => 2, 'error' => null]);
     }
 
     private function poisonedSubscriber(string $id): Subscriber

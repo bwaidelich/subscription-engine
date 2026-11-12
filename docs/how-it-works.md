@@ -7,6 +7,7 @@ The technical details behind the [README](../README.md). You don't need them to 
 - [What is guaranteed](#what-is-guaranteed)
 - [Bounded catch-ups](#bounded-catch-ups)
 - [Concurrent workers](#concurrent-workers)
+- [Filtered subscribers](#filtered-subscribers)
 - [`reset()` and `setup()` with running workers](#reset-and-setup-with-running-workers)
 - [Exceptions during a catch-up](#exceptions-during-a-catch-up)
 - [Writing your own store or adapter](#writing-your-own-store-or-adapter)
@@ -89,6 +90,25 @@ The engine keeps no memory of failed runs. As the lowest position is claimed fir
 
 See [decisions.md](./decisions.md#skip-locked-catch-ups-target-20) for the reasoning.
 
+## Filtered subscribers
+
+A subscriber can declare a filter, so that it only receives matching events. Its type depends on the adapter, for example a `Query` for the DCB adapter:
+
+```php
+Subscriber::create(
+    id: 'orders',
+    handler: $handler,
+    filter: Query::fromItems(QueryItem::create(eventTypes: 'OrderPlaced')),
+);
+```
+
+- If a run contains only this subscription, for example with `catchUpNextActive()` and `bootNext()`, the adapter applies the filter and only matching events are read. The run reads up to the position of the last event at its start, and the subscription moves there even if none of the events matched
+- A run with several subscriptions reads all events once and passes each one only to the subscribers whose filter matches it. The positions of the others advance as well
+- `limit` counts the events that are read, so with one filtered subscription it counts matching events
+- The filter is not persisted. Changing it does not pass the events that the old filter excluded, use a new subscriber id or `reset()` for that
+
+See [decisions.md](./decisions.md#filtered-reads-target-20) for the reasoning.
+
 ## `reset()` and `setup()` with running workers
 
 Workers don't have to be stopped. `reset()` waits for running catch-ups and sets the status `RESETTING`, which no catch-up matches, for all matching subscriptions. The reset functions then run without a lock, so they can use DDL like `TRUNCATE`, and each subscription goes to `BOOTING` at position 0 afterwards.
@@ -119,6 +139,7 @@ The engine needs an implementation of two interfaces. The [doctrine store](https
 ### `EventStoreAdapter`
 
 The [`EventStoreAdapter`](../src/EventStore/EventStoreAdapter.php) connects the engine to an event store. It reads events in the order of their position, determines the position of an event, and returns the position of the last one.
+It defines which filters subscribers can declare: `read()` has to apply them, and `matches()` has to decide the same way for a single event.
 
 ### `SubscriptionStore`
 
