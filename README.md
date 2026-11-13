@@ -20,10 +20,7 @@ flowchart LR
 - **Rebuild at any time:** Replay all events into a projection after fixing a bug or changing its schema
 - **Isolated failures:** A failing subscriber stops, while the others continue
 - **Exactly once:** A projection that uses the connection of the subscription store is saved together with its progress
-- **Ready to scale:** Process large backlogs in batches and run workers in parallel (2.0)
-
-> [!NOTE]
-> This documentation describes the upcoming version 2.0. Features that aren't part of the latest release are marked with **(2.0)**, see [how to try them](#try-the-upcoming-version).
+- **Ready to scale:** Process large backlogs in batches and run workers in parallel
 
 ## Quick start
 
@@ -110,7 +107,7 @@ The engine itself contains no database code. Choose one event store adapter and 
 | | [wwwision/subscription-engine-neos-adapter](https://github.com/bwaidelich/subscription-engine-neos-adapter) | [neos/eventstore](https://github.com/neos/eventstore) |
 | **A subscription store** | [wwwision/subscription-engine-doctrine](https://github.com/bwaidelich/subscription-engine-doctrine) | MySQL, MariaDB, PostgreSQL and SQLite with Doctrine DBAL |
 | | [ekvedaras/subscription-engine-illuminate](https://packagist.org/packages/ekvedaras/subscription-engine-illuminate) | [Laravel database](https://laravel.com/docs/12.x/database) |
-| **Background processing** (optional) | [wwwision/subscription-engine-worker](https://github.com/bwaidelich/subscription-engine-worker) (2.0) | A long-running process with Supervisor and Kubernetes examples |
+| **Background processing** (optional) | [wwwision/subscription-engine-worker](https://github.com/bwaidelich/subscription-engine-worker) (not released yet) | A long-running process with Supervisor and Kubernetes examples |
 
 Nothing suitable? See [Writing your own store or adapter](./docs/how-it-works.md#writing-your-own-store-or-adapter).
 
@@ -125,8 +122,8 @@ The handlers in these guides receive a `SequencedEvent`, as in the quick start. 
 - [Rebuild a projection](#rebuild-a-projection)
 - [Handle failures](#handle-failures)
 - [See what is going on](#see-what-is-going-on)
-- [Process a large backlog in batches](#process-a-large-backlog-in-batches-20) (2.0)
-- [Run several workers in parallel](#run-several-workers-in-parallel-20) (2.0)
+- [Process a large backlog in batches](#process-a-large-backlog-in-batches)
+- [Run several workers in parallel](#run-several-workers-in-parallel)
 
 ### Add a projection
 
@@ -183,7 +180,7 @@ $eventStore->append($events);
 $engine->catchUpActive();
 ```
 
-To keep requests fast, leave this to a process that runs in the background instead, for example [wwwision/subscription-engine-worker](https://github.com/bwaidelich/subscription-engine-worker) (2.0).
+To keep requests fast, leave this to a process that runs in the background instead, for example [wwwision/subscription-engine-worker](https://github.com/bwaidelich/subscription-engine-worker) (not released yet).
 
 ### Rebuild a projection
 
@@ -247,7 +244,7 @@ $engine->onEngineEvent(function (EngineEvent $event): void {
 });
 ```
 
-### Process a large backlog in batches (2.0)
+### Process a large backlog in batches
 
 By default, a catch-up reads to the end of the event log in a single transaction. With `limit`, it stops after that number of events and saves its progress, so that the transactions stay small:
 
@@ -262,7 +259,7 @@ do {
 
 `boot()` supports `limit` as well. [Details](./docs/how-it-works.md#bounded-catch-ups)
 
-### Run several workers in parallel (2.0)
+### Run several workers in parallel
 
 [wwwision/subscription-engine-worker](https://github.com/bwaidelich/subscription-engine-worker) does this for you: Start the same script as often as you like. It also takes care of stop signals, retries and restarts.
 
@@ -297,7 +294,7 @@ All methods accept an optional `SubscriptionEngineCriteria` to restrict them to 
 | `catchUpActive()` | Passes new events to subscribers in the status `ACTIVE` |
 | `reset()` | Calls the `reset` function and moves subscribers back to the first event, in the status `BOOTING` |
 | `getSubscriptions()` | Returns the state of the subscriptions. `getSubscription($id)` returns a single one |
-| `bootNext()`, `catchUpNextActive()` | Like `boot()` and `catchUpActive()`, for a single free subscription (2.0) |
+| `bootNext()`, `catchUpNextActive()` | Like `boot()` and `catchUpActive()`, for a single free subscription |
 
 ### Statuses
 
@@ -307,20 +304,8 @@ All methods accept an optional `SubscriptionEngineCriteria` to restrict them to 
 | `BOOTING` | Set up or reset, past events are pending | Call `boot()` |
 | `ACTIVE` | Receives new events | Nothing |
 | `ERROR` | A subscriber failed | Fix the cause, then call `reset()` and `boot()` |
-| `RESETTING` (2.0) | The `reset` function is running, or has crashed | Wait. [If it has crashed](./docs/how-it-works.md#reset-and-setup-with-running-workers), call `reset($criteria, force: true)` |
+| `RESETTING` | The `reset` function is running, or has crashed | Wait. [If it has crashed](./docs/how-it-works.md#reset-and-setup-with-running-workers), call `reset($criteria, force: true)` |
 | `DETACHED` | The subscriber doesn't exist anymore | Nothing if you removed it. Otherwise call `reset()` and `boot()` |
-
-## Try the upcoming version
-
-Version 2.0 isn't released yet, and its APIs can still change. To try it, allow development versions in your `composer.json`:
-
-```bash
-composer config minimum-stability dev
-composer config prefer-stable true
-composer require wwwision/subscription-engine:2.x-dev wwwision/subscription-engine-doctrine:dev-main wwwision/subscription-engine-dcb-adapter:dev-main
-```
-
-With `neos/eventstore`, use `wwwision/subscription-engine-neos-adapter:dev-main` instead of the DCB adapter. Coming from 1.x? See the [upgrade guide](./docs/upgrading.md).
 
 ## Learn more
 

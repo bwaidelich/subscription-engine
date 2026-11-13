@@ -1,8 +1,5 @@
 # Upgrading to 2.0
 
-> [!NOTE]
-> Version 2.0 isn't released yet. The signatures below might still change until then.
-
 ## If you use the engine
 
 `SubscriptionStatus` has the new case `RESETTING`, code with an exhaustive `match` has to handle it. A failing reset function now moves the subscription to `ERROR`, it used to keep its status.
