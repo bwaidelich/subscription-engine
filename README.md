@@ -107,7 +107,7 @@ The engine itself contains no database code. Choose one event store adapter and 
 | | [wwwision/subscription-engine-neos-adapter](https://github.com/bwaidelich/subscription-engine-neos-adapter) | [neos/eventstore](https://github.com/neos/eventstore) |
 | **A subscription store** | [wwwision/subscription-engine-doctrine](https://github.com/bwaidelich/subscription-engine-doctrine) | MySQL, MariaDB, PostgreSQL and SQLite with Doctrine DBAL |
 | | [ekvedaras/subscription-engine-illuminate](https://packagist.org/packages/ekvedaras/subscription-engine-illuminate) | [Laravel database](https://laravel.com/docs/12.x/database) |
-| **Background processing** (optional) | [wwwision/subscription-engine-worker](https://github.com/bwaidelich/subscription-engine-worker) (not released yet) | A long-running process with Supervisor and Kubernetes examples |
+| **Background processing** (optional) | [wwwision/subscription-engine-worker](https://github.com/bwaidelich/subscription-engine-worker) | A long-running process with Supervisor and Kubernetes examples |
 
 Nothing suitable? See [Writing your own store or adapter](./docs/how-it-works.md#writing-your-own-store-or-adapter).
 
@@ -180,7 +180,7 @@ $eventStore->append($events);
 $engine->catchUpActive();
 ```
 
-To keep requests fast, leave this to a process that runs in the background instead, for example [wwwision/subscription-engine-worker](https://github.com/bwaidelich/subscription-engine-worker) (not released yet).
+To keep requests fast, leave this to a process that runs in the background instead, for example [wwwision/subscription-engine-worker](https://github.com/bwaidelich/subscription-engine-worker).
 
 ### Rebuild a projection
 
